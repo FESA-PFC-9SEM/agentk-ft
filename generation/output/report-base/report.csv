@@ -1,0 +1,71 @@
+metric,key,value
+kind_distribution,"Deployment",272
+kind_distribution,"Job",164
+kind_distribution,"StatefulSet",151
+kind_distribution,"DaemonSet",137
+kind_distribution,"Pod",110
+kind_distribution,"Role",109
+kind_distribution,"ClusterRole",92
+kind_distribution,"CronJob",26
+kind_distribution,"RoleBinding",7
+kind_distribution,"ClusterRoleBinding",2
+kind_distribution,"Namespace",1
+namespace_distribution,"default",180
+namespace_distribution,"(default)",178
+namespace_distribution,"web-prod",14
+namespace_distribution,"healthcare-staging",11
+namespace_distribution,"media-streaming-prod",11
+namespace_distribution,"web-qa",11
+namespace_distribution,"energy-prod",11
+namespace_distribution,"growth-qa",11
+namespace_distribution,"education-qa",10
+namespace_distribution,"data-qa",10
+namespace_distribution,"web-staging",9
+namespace_distribution,"sec-qa",9
+namespace_distribution,"energy-qa",9
+namespace_distribution,"core-dev",9
+namespace_distribution,"education-staging",9
+namespace_distribution,"energy-dev",9
+namespace_distribution,"core-staging",9
+namespace_distribution,"media-streaming-staging",9
+namespace_distribution,"logistics-staging",9
+namespace_distribution,"e-commerce-qa",8
+image_distribution,"node",101
+image_distribution,"python",41
+image_distribution,"my-jvm-app",34
+image_distribution,"golang",27
+image_distribution,"mcr.microsoft.com/dotnet/aspnet",18
+image_distribution,"my-python-app",17
+image_distribution,"busybox",7
+image_distribution,"my-node-app",6
+image_distribution,"mycompany/jvm-app",4
+image_distribution,"my-go-app",4
+image_distribution,"mycompany/gateway",3
+image_distribution,"mycompany/notification-service",3
+image_distribution,"mcr.microsoft.com/dotnet/sdk",3
+image_distribution,"fintech/recommendation-service",2
+image_distribution,"mycompany/reporting-service",2
+image_distribution,"my-dotnet-app",2
+image_distribution,"my-repo/python-app",2
+image_distribution,"mycompany/node-app",2
+image_distribution,"myregistry.com/node-app",2
+image_distribution,"my-go-app-image",2
+container_count_distribution,"1",849
+container_count_distribution,"2",10
+container_count_distribution,"3",1
+structural_uniqueness_ratio,-,0.9982
+top_ngram,"containers: - name:",865
+top_ngram,"spec: containers: -",863
+top_ngram,"env: - name:",862
+top_ngram,"apiVersion: apps/v1 kind:",563
+top_ngram,"selector: matchLabels: app:",556
+top_ngram,"ports: - containerPort:",542
+top_ngram,"template: metadata: labels:",499
+top_ngram,"metadata: labels: app:",492
+top_ngram,"replicas: 3 selector:",419
+top_ngram,"3 selector: matchLabels:",419
+top_ngram,"get list watch",372
+top_ngram,"verbs: get list",368
+top_ngram,"true - name:",363
+top_ngram,"value: true -",361
+top_ngram,"- name: config-volume",346

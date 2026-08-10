@@ -1,0 +1,68 @@
+metric,key,value
+kind_distribution,"Deployment",260
+kind_distribution,"StatefulSet",108
+kind_distribution,"Pod",103
+kind_distribution,"DaemonSet",87
+kind_distribution,"Job",84
+kind_distribution,"CronJob",19
+kind_distribution,"PersistentVolumeClaim",1
+kind_distribution,"ConfigMap",1
+namespace_distribution,"(default)",101
+namespace_distribution,"default",99
+namespace_distribution,"data-qa",11
+namespace_distribution,"growth-dev",9
+namespace_distribution,"logistics-prod",9
+namespace_distribution,"core-prod",8
+namespace_distribution,"web-prod",8
+namespace_distribution,"sre-qa",8
+namespace_distribution,"data-prod",8
+namespace_distribution,"telecom-prod",7
+namespace_distribution,"mobile-dev",7
+namespace_distribution,"gaming-dev",7
+namespace_distribution,"government-staging",7
+namespace_distribution,"web-qa",7
+namespace_distribution,"growth-qa",7
+namespace_distribution,"sec-dev",7
+namespace_distribution,"gaming-prod",6
+namespace_distribution,"education-staging",6
+namespace_distribution,"media-streaming-dev",6
+namespace_distribution,"web-staging",6
+image_distribution,"mcr.microsoft.com/dotnet/aspnet",122
+image_distribution,"node",78
+image_distribution,"python",59
+image_distribution,"docker.io/library/openjdk",48
+image_distribution,"gcr.io/google-samples/hello-app",38
+image_distribution,"nginx",31
+image_distribution,"docker.io/library/python",30
+image_distribution,"nginx:sha256",21
+image_distribution,"docker.io/node",20
+image_distribution,"mcr.microsoft.com/dotnet/sdk",17
+image_distribution,"docker.io/library/go",10
+image_distribution,"mcr.microsoft.com/dotnet/core/aspnet",8
+image_distribution,"docker.io/library/golang",6
+image_distribution,"docker.io/library/java",5
+image_distribution,"busybox",5
+image_distribution,"sha256",3
+image_distribution,"docker.io/python",2
+image_distribution,"docker.io/library/node",2
+image_distribution,"public-image",2
+image_distribution,"mcr.microsoft.com/dotnet/core/sdk",2
+container_count_distribution,"1",651
+container_count_distribution,"2",8
+container_count_distribution,"3",2
+structural_uniqueness_ratio,-,1.0
+top_ngram,"valueFrom: secretKeyRef: name:",818
+top_ngram,"containers: - name:",668
+top_ngram,"spec: containers: -",664
+top_ngram,"- name: SESSION_TIMEOUT",661
+top_ngram,"name: SESSION_TIMEOUT value:",659
+top_ngram,"- name: API_TOKEN_HEADER",657
+top_ngram,"env: - name:",656
+top_ngram,"name: API_TOKEN_HEADER value:",655
+top_ngram,"API_TOKEN_HEADER value: X-Api-Token",644
+top_ngram,"SESSION_TIMEOUT value: 3600",636
+top_ngram,"value: X-Api-Token -",606
+top_ngram,"X-Api-Token - name:",606
+top_ngram,"- name: DB_PASSWORD",595
+top_ngram,"value: 3600 -",594
+top_ngram,"3600 - name:",594
