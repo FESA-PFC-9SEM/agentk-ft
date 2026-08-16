@@ -1,0 +1,30 @@
+# Training stack for finetune/train_unsloth.py. Intentionally separate from
+# the root requirements.txt: these are heavy, GPU/CUDA-specific, and only
+# needed on the machine that actually trains -- keeping them out of the
+# core dataset-pipeline environment avoids forcing a multi-GB torch install
+# on machines that only ever run dataset/ and generation/.
+#
+# Also intentionally a SEPARATE venv (finetune/.venv, Python 3.11), not the
+# project's root .venv: this stack (torch/unsloth/bitsandbytes/dill via
+# datasets) does not work on Python 3.14 as of this writing -- dill's
+# patched Pickler is incompatible with 3.14's changed C-level Pickler
+# internals (TypeError: Pickler._batch_setitems() takes 2 positional
+# arguments but 3 were given, surfacing anywhere datasets.Dataset.map() or
+# load_dataset() runs, including inside SFTTrainer itself).
+#
+# Setup:
+#   uv python install 3.11
+#   uv venv --python 3.11 finetune/.venv
+#   uv pip install --python finetune/.venv/bin/python torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   uv pip install --python finetune/.venv/bin/python -r finetune/requirements.txt
+#
+# torch/torchvision are installed separately above (not listed here) because
+# they need --index-url for the CUDA 12.6 build; a plain PyPI install here
+# would pull a CPU-only wheel.
+
+unsloth==2026.8.18
+trl==0.24.0
+datasets==4.3.0
+peft==0.20.0
+bitsandbytes==0.50.1
+accelerate==1.14.0
