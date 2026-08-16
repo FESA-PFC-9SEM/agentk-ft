@@ -28,3 +28,9 @@ datasets==4.3.0
 peft==0.20.0
 bitsandbytes==0.50.1
 accelerate==1.14.0
+
+# For finetune/evaluate.py, which reuses dataset/schema.py's
+# validate_response() and the same jsonpatch round-trip check
+# dataset/build.py uses, now applied to the model's own generated patch.
+jsonpatch>=1.33
+jsonpointer>=2.4
