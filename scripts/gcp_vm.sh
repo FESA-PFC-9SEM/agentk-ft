@@ -1,0 +1,19 @@
+gcloud compute instances create tcc-treino \
+    --project=project-064f3462-cb6f-47b4-9ff \
+    --zone=us-east1-b \
+    --machine-type=a2-highgpu-1g \
+    --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
+    --no-restart-on-failure \
+    --maintenance-policy=TERMINATE \
+    --provisioning-model=STANDARD \
+    --host-error-timeout-seconds=300 \
+    --service-account=687758916292-compute@developer.gserviceaccount.com \
+    --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append \
+    --accelerator=count=1,type=nvidia-tesla-a100 \
+    --create-disk=auto-delete=yes,boot=yes,device-name=tcc-treino,image=projects/debian-cloud/global/images/debian-13-trixie-v20260811,mode=rw,size=10,type=pd-standard \
+    --create-disk=device-name=tcc-ssd-treino,mode=rw,name=tcc-ssd-treino,size=100,type=pd-balanced \
+    --no-shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --labels=goog-ec-src=vm_add-gcloud \
+    --reservation-affinity=none
