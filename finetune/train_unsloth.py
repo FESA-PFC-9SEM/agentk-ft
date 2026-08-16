@@ -18,9 +18,8 @@ Usage:
 """
 
 from __future__ import annotations
-import json
 import unsloth
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from trl import SFTConfig, SFTTrainer
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import train_on_responses_only
@@ -32,19 +31,20 @@ from pathlib import Path
 
 
 def load_jsonl_as_dataset(path: Path) -> Dataset:
-    """Reads a .jsonl file into a datasets.Dataset via Dataset.from_list,
-    bypassing datasets.load_dataset's dill-based cache fingerprinting --
-    that path breaks on newer Python (e.g. 3.13+/3.14) where dill's patched
-    Pickler is incompatible with the stdlib's _batch_setitems signature
-    (TypeError: Pickler._batch_setitems() takes 2 positional arguments but
-    3 were given). from_list stays in-process and avoids it entirely."""
-    records = []
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return Dataset.from_list(records)
+    """Reads a .jsonl file into a datasets.Dataset via load_dataset, which
+    memory-maps the underlying Arrow file instead of first materializing
+    every record as a Python dict in a list (Dataset.from_list) -- much
+    lighter on host RAM for a 16k-row dataset, which matters on GPU VMs that
+    pair a lot of VRAM with comparatively little system RAM (e.g. L4
+    instances).
+
+    NOTE: load_dataset's dill-based cache fingerprinting breaks on newer
+    Python (3.13+/3.14) -- TypeError: Pickler._batch_setitems() takes 2
+    positional arguments but 3 were given. This script only runs under the
+    pinned Python 3.11 finetune/.venv (see the module docstring), where
+    this is verified to work fine; don't run it under the project's main
+    3.14 venv."""
+    return load_dataset("json", data_files=str(path), split="train")
 
 
 # Hardware-dependent knobs only -- --r/--lora-alpha, --lr, --epochs etc. are
@@ -186,6 +186,12 @@ def main(argv=None) -> None:
             max_steps=args.max_steps,
             output_dir=args.output_dir,
             logging_steps=args.logging_steps,
+            # A worker pool for dataset .map()/tokenization multiplies host
+            # RAM usage by roughly the worker count (each process gets its
+            # own copy of the in-flight data) -- keep it single-process on
+            # GPU VMs that pair a lot of VRAM with comparatively little
+            # system RAM. Raise this only if host RAM is confirmed generous.
+            dataset_num_proc=1,
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.eval_batch_size,
             eval_accumulation_steps=args.eval_accumulation_steps,

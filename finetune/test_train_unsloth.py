@@ -7,10 +7,25 @@ import pytest
 #   finetune/.venv/bin/python -m pytest finetune/test_train_unsloth.py
 pytest.importorskip("unsloth")
 
-from finetune.train_unsloth import PRESETS, parse_args
+import json
+
+from finetune.train_unsloth import PRESETS, load_jsonl_as_dataset, parse_args
 
 
 _SEVEN_B = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+
+
+def test_load_jsonl_as_dataset_reads_all_rows(tmp_path):
+    path = tmp_path / "data.jsonl"
+    with path.open("w", encoding="utf-8") as fh:
+        for i in range(5):
+            fh.write(json.dumps({"text": f"example {i}"}) + "\n")
+
+    ds = load_jsonl_as_dataset(path)
+
+    assert len(ds) == 5
+    assert ds[0]["text"] == "example 0"
+    assert ds[4]["text"] == "example 4"
 
 
 def test_default_preset_is_4060ti_and_matches_current_hardcoded_values():
