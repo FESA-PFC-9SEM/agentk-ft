@@ -246,6 +246,17 @@ GOBIN=$(go env GOPATH)/bin go install github.com/yannh/kubeconform/cmd/kubeconfo
 export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
+Fine-tuning (`finetune/`) needs its own environment — a dedicated Python
+3.11 venv, separate from the one above (see `finetune/requirements.txt` for
+why). On a fresh training VM, one command does the whole setup, including
+pulling the compressed dataset back in:
+
+```bash
+./finetune/setup_vm.sh
+# different CUDA version than the default (cu126)?
+CUDA_INDEX=https://download.pytorch.org/whl/cu128 ./finetune/setup_vm.sh
+```
+
 ---
 
 ## Usage
@@ -292,33 +303,28 @@ All `generate.py` runs are resumable — an interrupted or re-run command
 fills in only what's missing, keyed by a deterministic per-index seed
 (`--seed * 1_000_003 + index`), never duplicating work.
 
-### Compressing dataset files
+### Compressing dataset files for git
 
-A full-scale `train.jsonl` runs tens to hundreds of MB — worth compressing
-for storage or transfer to wherever fine-tuning happens. `-k` keeps the
-original file alongside the compressed one (compression is not destructive).
-
-```bash
-# compress (gzip, keeps the .jsonl around too)
-gzip -k dataset/output/*.jsonl
-
-# decompress (also keeps the .jsonl.gz around)
-gzip -dk dataset/output/*.jsonl.gz
-```
-
-`zstd` is a faster alternative with a comparable or better ratio, if
-available (`which zstd`):
+A full-scale `train.jsonl` runs tens to hundreds of MB —
+`dataset/output/unsloth/train.jsonl` alone hit ~130MB in one run, over
+**GitHub's 100MiB hard file-size limit**. `dataset/output/`,
+`dataset/output/unsloth/`, and `generation/output/`'s raw `.jsonl` files are
+gitignored for exactly this reason; only their gzipped `.jsonl.gz`
+counterparts get committed.
 
 ```bash
-# compress
-zstd -k dataset/output/train.jsonl -o dataset/output/train.jsonl.zst
+# before committing: compress every dataset/generation .jsonl to .jsonl.gz
+./scripts/compress_dataset.sh
 
-# decompress
-zstd -dk dataset/output/train.jsonl.zst -o dataset/output/train.jsonl
+# after cloning/pulling on a new machine (e.g. a training VM): inflate them back
+./scripts/decompress_dataset.sh
 ```
 
-Measured on this project's `val.jsonl`: gzip took it from 11 MB to 947 KB
-(~11.6x).
+Measured on the ~130MB `dataset/output/unsloth/train.jsonl`: gzip took it to
+~7MB (~18.6x) — comfortably clear of the limit. Round-trip integrity is
+byte-exact (verified via checksum, not just "it decompresses without error").
+`finetune/setup_vm.sh` (below) calls `decompress_dataset.sh` automatically as
+its last step, so a fresh training VM doesn't need this run by hand.
 
 ---
 
