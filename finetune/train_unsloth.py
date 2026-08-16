@@ -67,6 +67,22 @@ PRESETS = {
         "eval_steps": 100,
         "save_steps": 100,
     },
+    # NVIDIA L4, 24GB VRAM: far less VRAM-constrained than the 4060 Ti, but
+    # noticeably less compute than an A100 (Ada Lovelace, no NVLink, roughly
+    # RTX 4090-class throughput) -- same effective batch (32) as the a100
+    # preset via more accumulation, but a smaller per-device batch, since a
+    # slower GPU gains less from a large single batch and 24GB has less
+    # margin for an allocation spike than 40-80GB.
+    "l4": {
+        "model": "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
+        "max_seq_length": 4096,
+        "batch_size": 8,
+        "grad_accum": 4,
+        "eval_batch_size": 4,
+        "eval_accumulation_steps": 2,
+        "eval_steps": 50,
+        "save_steps": 50,
+    },
     # A100 (40GB or 80GB): no longer VRAM-constrained -- bigger batches,
     # less accumulation, less defensive eval offloading, more frequent
     # checkpoints since total steps roughly halve at the larger effective

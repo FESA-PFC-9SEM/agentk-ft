@@ -38,6 +38,21 @@ def test_a100_preset_applies_recommended_values():
     assert args.save_steps == 50
 
 
+def test_l4_preset_applies_recommended_values():
+    args = parse_args(["--preset", "l4"])
+    assert args.model == _SEVEN_B
+    assert args.max_seq_length == 4096
+    assert args.batch_size == 8
+    assert args.grad_accum == 4
+    assert args.eval_batch_size == 4
+    assert args.eval_accumulation_steps == 2
+    assert args.eval_steps == 50
+    assert args.save_steps == 50
+    # same effective batch as a100 (32), via more accumulation instead of a
+    # larger per-device batch -- less VRAM/compute margin than a100
+    assert args.batch_size * args.grad_accum == 32
+
+
 def test_explicit_flag_overrides_preset():
     args = parse_args(["--preset", "a100", "--batch-size", "32"])
     assert args.batch_size == 32
