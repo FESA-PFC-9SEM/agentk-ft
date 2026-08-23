@@ -1,6 +1,8 @@
 import argparse
 import json
 
+import pytest
+
 from finetune.export_for_unsloth import (
     char_approx_render_and_count,
     export,
@@ -136,3 +138,34 @@ def test_export_skips_missing_split_files(tmp_path):
     assert "train" in summary
     assert "val" not in summary
     assert "test" not in summary
+
+
+def test_export_raises_instead_of_silently_degrading_when_tokenizer_load_fails(tmp_path, monkeypatch):
+    # Regression test: a failed tokenizer load used to silently fall back to
+    # the chars/4 approximation, which can't render the real chat template
+    # -- every exported example then missed the <|im_start|>assistant
+    # marker Unsloth's train_on_responses_only looks for, corrupting an
+    # entire training run without any hard error at export time. Must fail
+    # loudly instead, unless --char-approx was passed explicitly.
+    import finetune.export_for_unsloth as export_module
+
+    def _always_fails(name):
+        raise OSError("simulated network failure")
+
+    monkeypatch.setattr(export_module, "load_tokenizer", _always_fails)
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    with (input_dir / "train.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(_example()) + "\n")
+
+    args = argparse.Namespace(
+        input_dir=str(input_dir),
+        output_dir=str(tmp_path / "out"),
+        tokenizer="unused",
+        max_seq_length=4096,
+        char_approx=False,
+    )
+
+    with pytest.raises(OSError):
+        export(args)

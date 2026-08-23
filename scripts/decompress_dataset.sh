@@ -8,7 +8,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 shopt -s nullglob
-files=(dataset/output/*.jsonl.gz dataset/output/unsloth/*.jsonl.gz generation/output/*.jsonl.gz)
+files=(
+    dataset/output/*.jsonl.gz
+    dataset/output/unsloth/*.jsonl.gz
+    dataset/output-multi-defect/*.jsonl.gz
+    dataset/output-multi-defect/unsloth/*.jsonl.gz
+    generation/output/*.jsonl.gz
+)
 
 if [[ ${#files[@]} -eq 0 ]]; then
     echo "No .jsonl.gz files found to decompress."

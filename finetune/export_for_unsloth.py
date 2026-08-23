@@ -115,18 +115,19 @@ def export(args: argparse.Namespace) -> dict:
     tokenizer = None
     use_char_approx = args.char_approx
     if not use_char_approx:
-        try:
-            print(f"Loading tokenizer '{args.tokenizer}'...", file=sys.stderr)
-            tokenizer = load_tokenizer(args.tokenizer)
-        except Exception as e:
-            print(
-                f"[WARNING] could not load tokenizer '{args.tokenizer}' ({e}); "
-                "falling back to a chars/4 token estimate. Install `transformers` "
-                "and ensure network access to Hugging Face for accurate counts, "
-                "or pass --char-approx to silence this.",
-                file=sys.stderr,
-            )
-            use_char_approx = True
+        # NOTE: this used to fall back to the chars/4 approximation silently
+        # on any load failure (network hiccup, HF Hub rate limit, ...). That
+        # approximation also can't render the model's real chat template, so
+        # every example's "text" field ends up missing the actual
+        # <|im_start|>assistant marker Unsloth's train_on_responses_only
+        # looks for -- training then either crashes with a confusing "masked
+        # every label to -100" error, or worse, silently trains on garbage
+        # formatting. A failed tokenizer load is a real problem, not a
+        # reason to keep going with degraded output: fail loudly and let the
+        # caller decide (retry, or pass --char-approx explicitly to accept
+        # the degraded mode on purpose).
+        print(f"Loading tokenizer '{args.tokenizer}'...", file=sys.stderr)
+        tokenizer = load_tokenizer(args.tokenizer)
 
     summary: dict = {
         "max_seq_length": args.max_seq_length,

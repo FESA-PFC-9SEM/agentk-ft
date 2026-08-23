@@ -1,6 +1,6 @@
 gcloud compute instances create tcc-treino \
     --project=project-064f3462-cb6f-47b4-9ff \
-    --zone=us-central1-a \
+    --zone=us-east1-b \
     --machine-type=g2-standard-4 \
     --network-interface=network-tier=STANDARD,stack-type=IPV4_ONLY,subnet=default \
     --maintenance-policy=TERMINATE \

@@ -31,6 +31,7 @@ import yaml
 
 from dataset.dedup import dedup
 from dataset.detect import detect_structural
+from dataset.multi_mutate import mutate_multi_defect
 from dataset.mutate import FAKE_SECRET_VAR_NAMES, MUTATORS
 from dataset.normalize import normalize_document
 from dataset.scanning import find_secrets
@@ -261,49 +262,97 @@ def build(args: argparse.Namespace) -> dict:
     if not canonical_records:
         raise RuntimeError("no usable canonical document: pipeline cannot generate examples")
 
-    # Pool of applicable mutations per rule: tries to mutate every canonical
-    # doc once; keeps the result so we don't mutate twice with divergent rng
-    # states between the counting phase and the sampling phase.
-    pools: dict[str, list[tuple[Record, object]]] = {rid: [] for rid in RULE_IDS}
+    strategy = getattr(args, "strategy", "single-defect")
+    min_defects = getattr(args, "min_defects", 2)
+    max_defects = getattr(args, "max_defects", 4)
+
     mutation_precondition_failures = 0
-    order = list(canonical_records)
-    rng.shuffle(order)
-    for rid in RULE_IDS:
-        mutator = MUTATORS[rid]
+    examples = []
+
+    if strategy == "single-defect":
+        # Pool of applicable mutations per rule: tries to mutate every
+        # canonical doc once; keeps the result so we don't mutate twice with
+        # divergent rng states between the counting phase and the sampling
+        # phase.
+        pools: dict[str, list[tuple[Record, object]]] = {rid: [] for rid in RULE_IDS}
+        order = list(canonical_records)
+        rng.shuffle(order)
+        for rid in RULE_IDS:
+            mutator = MUTATORS[rid]
+            for r in order:
+                try:
+                    if rid == "KSEC-001":
+                        result = mutator(r.doc, rng, candidate_names=ksec001_candidate_names)
+                    else:
+                        result = mutator(r.doc, rng)
+                except AssertionError:
+                    # A mutator's own internal invariant didn't hold for this
+                    # particular document (e.g. a malformed field from noisy
+                    # generated input defeated the "this mutation always
+                    # produces a finding" assumption). This is a per-document,
+                    # per-rule skip, not a pipeline failure: the same document
+                    # is still tried against every other rule normally.
+                    mutation_precondition_failures += 1
+                    continue
+                if result is not None:
+                    pools[rid].append((r, result))
+
+        quotas = _resolve_quotas(args, pools)
+
+        for rid in RULE_IDS:
+            pool = pools[rid]
+            rng.shuffle(pool)
+            for r, result in pool[: quotas[rid]]:
+                assert_round_trip(result.mutated_doc, result.patch, result.canonical, context=f"{rid}/{r.repo}")
+                response = Response(
+                    findings=result.findings,
+                    patch=result.patch,
+                    new_resources=result.new_resources,
+                    notes=[],
+                )
+                example = make_example(result.mutated_doc, response, r.repo, rid)
+                examples.append((r.repo, example))
+    else:
+        # Multi-defect strategy: each example carries 2+ SIMULTANEOUS
+        # findings, composed by dataset/multi_mutate.py from the same
+        # per-rule mutators used above -- see README.md's "Dataset
+        # generation strategies" for why this exists (a model trained only
+        # on single-defect examples missed a second finding when a
+        # real-world manifest actually had two).
+        negative_target = round(args.total * args.negative_ratio)
+        positive_target = args.total - negative_target
+        quotas = {"positive": positive_target, "negative": negative_target}
+
+        order = list(canonical_records)
+        rng.shuffle(order)
+        defect_count_distribution: collections.Counter = collections.Counter()
         for r in order:
+            if len(examples) >= positive_target:
+                break
             try:
-                if rid == "KSEC-001":
-                    result = mutator(r.doc, rng, candidate_names=ksec001_candidate_names)
-                else:
-                    result = mutator(r.doc, rng)
+                result = mutate_multi_defect(
+                    r.doc,
+                    rng,
+                    min_defects=min_defects,
+                    max_defects=max_defects,
+                    ksec001_candidate_names=ksec001_candidate_names,
+                )
             except AssertionError:
-                # A mutator's own internal invariant didn't hold for this
-                # particular document (e.g. a malformed field from noisy
-                # generated input defeated the "this mutation always
-                # produces a finding" assumption). This is a per-document,
-                # per-rule skip, not a pipeline failure: the same document
-                # is still tried against every other rule normally.
                 mutation_precondition_failures += 1
                 continue
-            if result is not None:
-                pools[rid].append((r, result))
-
-    quotas = _resolve_quotas(args, pools)
-
-    examples = []
-    for rid in RULE_IDS:
-        pool = pools[rid]
-        rng.shuffle(pool)
-        for r, result in pool[: quotas[rid]]:
-            assert_round_trip(result.mutated_doc, result.patch, result.canonical, context=f"{rid}/{r.repo}")
+            if result is None:
+                continue
+            assert_round_trip(result.mutated_doc, result.patch, result.canonical, context=f"multi/{r.repo}")
             response = Response(
                 findings=result.findings,
                 patch=result.patch,
                 new_resources=result.new_resources,
                 notes=[],
             )
-            example = make_example(result.mutated_doc, response, r.repo, rid)
+            rule_label = "multi:" + "+".join(sorted(result.applied_rule_ids))
+            example = make_example(result.mutated_doc, response, r.repo, rule_label)
             examples.append((r.repo, example))
+            defect_count_distribution[len(result.applied_rule_ids)] += 1
 
     negative_quota = quotas["negative"]
     negative_pool = list(canonical_records)
@@ -325,10 +374,13 @@ def build(args: argparse.Namespace) -> dict:
             for example in split_examples:
                 fh.write(json.dumps(example, ensure_ascii=False) + "\n")
 
+    diagnostic["strategy"] = strategy
     diagnostic["quotas"] = quotas
     diagnostic["mutation_precondition_failures"] = mutation_precondition_failures
     diagnostic["examples_emitted"] = {k: len(v) for k, v in splits.items()}
     diagnostic["examples_emitted"]["total"] = sum(len(v) for v in splits.values())
+    if strategy == "multi-defect":
+        diagnostic["defect_count_distribution"] = dict(sorted(defect_count_distribution.items()))
 
     diag_path = output_dir / "diagnostic.json"
     diag_path.write_text(json.dumps(diagnostic, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -382,14 +434,33 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus-dir", default="corpus")
     parser.add_argument("--synthetic-dir", default=None, help="folder with *.curated.jsonl from generation/curate.py")
-    parser.add_argument("--output-dir", default="dataset/output")
+    parser.add_argument(
+        "--strategy",
+        choices=["single-defect", "multi-defect"],
+        default="single-defect",
+        help="single-defect (default): one injected finding per example. "
+        "multi-defect: 2+ simultaneous findings per example, see README.md's "
+        "'Dataset generation strategies' section",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="defaults to dataset/output for --strategy single-defect, "
+        "dataset/output-multi-defect for --strategy multi-defect",
+    )
+    parser.add_argument("--min-defects", type=int, default=2, help="multi-defect strategy only")
+    parser.add_argument("--max-defects", type=int, default=4, help="multi-defect strategy only")
     parser.add_argument("--limit", type=int, default=None, help="cap on parquet rows read (smoke test)")
     parser.add_argument("--total", type=int, default=2000, help="total number of examples to generate")
     parser.add_argument("--negative-ratio", type=float, default=0.35)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args(argv)
+
+    args = parser.parse_args(argv)
+    if args.output_dir is None:
+        args.output_dir = "dataset/output" if args.strategy == "single-defect" else "dataset/output-multi-defect"
+    return args
 
 
 def main(argv=None) -> None:

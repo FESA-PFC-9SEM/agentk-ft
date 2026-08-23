@@ -16,6 +16,7 @@ dataset only — no training happens here.
   - [Part A — `dataset/`](#part-a--dataset)
   - [Part B — `generation/`](#part-b--generation)
 - [Pipeline flow](#pipeline-flow)
+- [Dataset generation strategies](#dataset-generation-strategies)
 - [Setup](#setup)
 - [Usage](#usage)
 - [Testing](#testing)
@@ -227,6 +228,85 @@ you re-enable that rule.
 `pipeline.sh` chains generate → curate → report → `dataset.build` in one
 command (`--smoke` for a small end-to-end validation run, no args for the
 full-scale run).
+
+---
+
+## Dataset generation strategies
+
+Real-world testing of the first trained adapter (`sql.yaml`, then a batch of
+hand-written scenarios in `scenarios/`) surfaced a generalization gap: the
+model reliably caught a manifest's *one* problem, but missed a *second*
+simultaneous one (e.g. it found one plaintext credential but not a second in
+the same manifest). Root cause: every training example up to that point had
+**exactly one** injected defect — `dataset/mutate.py`'s per-rule mutators are
+each called once per example — so the model plausibly learned "at most one
+finding" as an implicit prior rather than actually searching the whole
+manifest.
+
+Rather than replace the original pipeline, this repo keeps **both**
+strategies side by side so results can be compared directly in the TCC
+write-up:
+
+| | **single-defect** (baseline) | **multi-defect** |
+|---|---|---|
+| Findings per positive example | exactly 1 | 2–4 (`--min-defects`/`--max-defects`) |
+| Mutation logic | `dataset/mutate.py` (`MUTATORS`) | `dataset/multi_mutate.py`, composing the same `MUTATORS` |
+| Dataset output | `dataset/output/` (default) | `dataset/output-multi-defect/` |
+| Training run folder | `runs/<timestamp>_single-defect_<model>/` | `runs/<timestamp>_multi-defect_<model>/` |
+
+`dataset/multi_mutate.py` doesn't reimplement any rule: it starts from the
+same clean canonical document, applies 2–4 of `mutate.py`'s existing
+per-rule mutators to it *in sequence* (each one seeing the previous step's
+already-mutated document), chains their inverse patches together, and
+re-derives the final finding set by re-running the detectors
+(`dataset/detect.py::detect_all`) against the fully mutated document — see
+that module's docstring for why this composition is safe (each rule injects
+into a disjoint structural area, so injecting rule B never dirties rule A's
+already-injected field).
+
+Running the multi-defect variant through the whole pipeline, end to end:
+
+```bash
+# 1. generate the dataset (same corpus, different mutation strategy)
+python -m dataset.build --strategy multi-defect --total 2000
+
+# 2. export for Unsloth
+finetune/.venv/bin/python -m finetune.export_for_unsloth \
+    --input-dir dataset/output-multi-defect \
+    --output-dir dataset/output-multi-defect/unsloth
+
+# 3. train -- --strategy only labels the auto-generated runs/ folder name,
+#    it does not change training logic; --data-dir is what actually matters
+finetune/.venv/bin/python -m finetune.train_unsloth \
+    --strategy multi-defect \
+    --data-dir dataset/output-multi-defect/unsloth \
+    --preset l4
+
+# 4. evaluate against its own held-out test set, and against scenarios/
+finetune/.venv/bin/python -m finetune.evaluate \
+    --adapter runs/<generated-name>/lora_adapter \
+    --test-file dataset/output-multi-defect/test.jsonl \
+    --output-dir runs/<generated-name>/eval
+finetune/.venv/bin/python -m finetune.run_scenarios \
+    --adapter runs/<generated-name>/lora_adapter \
+    --output runs/<generated-name>/scenarios_results.xlsx
+```
+
+The single-defect commands are identical minus `--strategy multi-defect`
+and the `-multi-defect` path suffixes — see [Usage](#usage) below.
+
+### Training run history
+
+`finetune/train_unsloth.py --output-dir` defaults to an auto-generated
+`runs/<YYYYMMDD-HHMM>_<strategy>_<model-slug>/` folder instead of a fixed
+path, so every run gets its own timestamped, strategy-labeled directory
+without a manual copy/rename step. Each run folder ends up self-describing:
+`run_info.json` (strategy, model, preset, hyperparameters — written at
+start), `checkpoint-*/`, `lora_adapter/`, `metrics.{jsonl,csv,png}`, and,
+once you run the commands above against it, `eval/` and
+`scenarios_results.xlsx`. `runs/` is gitignored (multi-GB checkpoints) —
+keep whatever you want in the TCC write-up (e.g. `run_info.json`,
+`metrics.png`, `eval_summary.json`) copied out separately.
 
 ---
 
@@ -492,6 +572,23 @@ pool-building loop catches `AssertionError` per document/rule (counted in
 document — from this or any other similarly narrow edge case in any rule —
 can't take down a multi-thousand-document production run.
 
+**Why the multi-defect strategy composes mutators instead of writing new
+ones.** Once a canonical document is confirmed fully clean
+(`detect_all(doc)` empty across every active rule — a stricter check than
+the single-defect pipeline runs per-rule, needed here because a multi-defect
+example asserts a *complete* finding set, not just one), the 6 active rules
+each touch a disjoint structural area (env vars, `securityContext`, image
+tag, selector labels, probe ports, resource quantities). That makes chaining
+them — apply mutator A to the clean doc, then mutator B to A's already-
+mutated output, etc. — safe by construction, with no interaction to design
+around: injecting B never dirties the field A just injected into. This
+reuses every rule's existing injection/detection logic unchanged; the only
+new code is the composition (chaining inverse patches in reverse
+mutation order, and re-deriving the combined finding set via `detect_all`
+on the final document rather than trusting the individually-computed
+findings, since intermediate JSON Pointer paths aren't guaranteed to still
+be valid after a later mutation touches a sibling field).
+
 ---
 
 ## Known limitations
@@ -548,11 +645,13 @@ can't take down a multi-thousand-document production run.
 │   ├── detect.py                 # one detector per rule
 │   ├── dedup.py                  # structural deduplication
 │   ├── normalize.py              # canonical hardening
-│   ├── mutate.py                 # one mutator per rule
-│   ├── build.py                  # pipeline orchestration
+│   ├── mutate.py                 # one mutator per rule (single-defect strategy)
+│   ├── multi_mutate.py           # composes mutate.py's mutators (multi-defect strategy)
+│   ├── build.py                  # pipeline orchestration (--strategy single-defect|multi-defect)
 │   ├── view.py                   # extract manifests from .jsonl for inspection
 │   ├── test_*.py                 # unit + round-trip tests
-│   └── output/                   # generated: train.jsonl, val.jsonl, test.jsonl, diagnostic.json
+│   ├── output/                   # generated (single-defect, default): train/val/test.jsonl, diagnostic.json
+│   └── output-multi-defect/      # generated (multi-defect strategy) -- see "Dataset generation strategies"
 ├── generation/                   # Part B — synthetic manifest generation
 │   ├── SETUP.md                  # runtime/model choice and setup steps
 │   ├── check_env.py              # GPU/Ollama/model readiness check

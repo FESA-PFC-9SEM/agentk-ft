@@ -1,0 +1,151 @@
+import random
+
+import jsonpatch
+import pytest
+
+from dataset.multi_mutate import mutate_multi_defect
+from dataset.schema import RULE_IDS
+
+
+def _apply_patch(mutated_doc, patch):
+    ops = [{k: v for k, v in p.to_dict().items() if k != "doc"} for p in patch]
+    return jsonpatch.apply_patch(mutated_doc, ops)
+
+
+def _rich_deployment():
+    """A doc every active mutator can apply to: pinned image (KSEC-005), no
+    securityContext (KSEC-002), no env vars (KSEC-001), matching
+    selector/template labels (KSEC-006), a probe port that matches a
+    declared container port (KSEC-007), and requests <= limits (KSEC-008)."""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "d"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "web"}},
+            "template": {
+                "metadata": {"labels": {"app": "web"}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "app",
+                            "image": "myapp:1.2.3",
+                            "ports": [{"containerPort": 8080}],
+                            "livenessProbe": {"httpGet": {"path": "/", "port": 8080}},
+                            "resources": {
+                                "requests": {"cpu": "100m", "memory": "64Mi"},
+                                "limits": {"cpu": "200m", "memory": "128Mi"},
+                            },
+                        }
+                    ]
+                },
+            },
+        },
+    }
+
+
+def test_round_trip_holds_for_a_multi_defect_composition():
+    rng = random.Random(1)
+    doc = _rich_deployment()
+
+    result = mutate_multi_defect(doc, rng, min_defects=2, max_defects=4)
+
+    assert result is not None
+    assert 2 <= len(result.applied_rule_ids) <= 4
+    assert len(set(result.applied_rule_ids)) == len(result.applied_rule_ids)  # no rule applied twice
+    assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+
+
+def test_findings_match_applied_rule_ids():
+    rng = random.Random(2)
+    doc = _rich_deployment()
+
+    result = mutate_multi_defect(doc, rng, min_defects=3, max_defects=3)
+
+    assert result is not None
+    assert len(result.applied_rule_ids) == 3
+    assert {f.rule_id for f in result.findings} == set(result.applied_rule_ids)
+    assert all(f.rule_id in RULE_IDS for f in result.findings)
+
+
+def test_new_resources_are_accumulated_when_ksec001_env_variant_is_injected():
+    # KSEC-001's env-variant mutator emits a companion Secret YAML in
+    # new_resources -- composing it with other rules must not silently drop
+    # that, or the model would be trained to reference a secretKeyRef whose
+    # backing Secret was never actually shown as needing creation.
+    doc = _rich_deployment()
+    saw_ksec001_with_new_resources = False
+    for seed in range(50):
+        result = mutate_multi_defect(doc, random.Random(seed), min_defects=2, max_defects=6)
+        if result is not None and "KSEC-001" in result.applied_rule_ids and result.new_resources:
+            saw_ksec001_with_new_resources = True
+            break
+    assert saw_ksec001_with_new_resources
+
+
+def test_rejects_a_base_doc_that_is_already_dirty():
+    rng = random.Random(3)
+    doc = _rich_deployment()
+    doc["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+
+    result = mutate_multi_defect(doc, rng, min_defects=2, max_defects=4)
+
+    assert result is None
+
+
+def test_returns_none_when_fewer_than_two_mutators_are_applicable():
+    rng = random.Random(4)
+    # A Service has no PodSpec at all -- none of the active mutators apply.
+    doc = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "s"}, "spec": {}}
+
+    result = mutate_multi_defect(doc, rng, min_defects=2, max_defects=4)
+
+    assert result is None
+
+
+def test_round_trip_holds_when_ksec001_env_variant_adds_a_new_field():
+    # Regression test: KSEC-001's env-variant mutator's own "canonical" isn't
+    # just its input doc -- it ADDS a secretKeyRef env entry (the
+    # fixed-forward form) that never existed before. A doc with no env at
+    # all reliably forces the env-variant (there's nothing to collide with),
+    # so composing it with another rule used to silently drop that addition
+    # from the overall round-trip target. See dataset/multi_mutate.py's
+    # canonical_delta comment for the fix.
+    doc = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "d", "labels": {"app": "d"}},
+        "spec": {
+            "selector": {"matchLabels": {"app": "d"}},
+            "template": {
+                "metadata": {"labels": {"app": "d"}},
+                "spec": {
+                    "containers": [
+                        {"name": "app", "image": "myapp:1.2.3", "resources": {"limits": {"cpu": "500m"}}}
+                    ]
+                },
+            },
+        },
+    }
+
+    found_ksec001 = False
+    for seed in range(200):
+        result = mutate_multi_defect(doc, random.Random(seed), min_defects=2, max_defects=4)
+        if result is None or "KSEC-001" not in result.applied_rule_ids:
+            continue
+        found_ksec001 = True
+        assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+
+    assert found_ksec001
+
+
+def test_multiple_runs_produce_varied_rule_combinations():
+    doc = _rich_deployment()
+    combos = set()
+    for seed in range(30):
+        rng = random.Random(seed)
+        result = mutate_multi_defect(doc, rng, min_defects=2, max_defects=3)
+        if result is not None:
+            combos.add(tuple(sorted(result.applied_rule_ids)))
+
+    assert len(combos) > 1

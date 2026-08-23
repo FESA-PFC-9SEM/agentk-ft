@@ -35,4 +35,4 @@ echo ">>> decompressing dataset"
 
 echo
 echo ">>> Setup complete. Run:"
-echo "    finetune/.venv/bin/python -m finetune.train_unsloth --model unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+echo "    finetune/.venv/bin/python -m finetune.train_unsloth --preset l4"

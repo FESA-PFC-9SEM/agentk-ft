@@ -1,0 +1,64 @@
+{
+  "max_seq_length": 4096,
+  "token_counting_method": "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
+  "train": {
+    "kept": 7955,
+    "dropped": 90,
+    "kept_token_percentiles": {
+      "p50": 1098,
+      "p75": 1284,
+      "p90": 1546,
+      "p95": 1803,
+      "p99": 2596,
+      "p100": 4096
+    },
+    "dropped_token_percentiles": {
+      "p50": 9915,
+      "p75": 31405,
+      "p90": 60903,
+      "p95": 69028,
+      "p99": 73040,
+      "p100": 73040
+    }
+  },
+  "val": {
+    "kept": 982,
+    "dropped": 10,
+    "kept_token_percentiles": {
+      "p50": 1082,
+      "p75": 1282,
+      "p90": 1533,
+      "p95": 1756,
+      "p99": 2533,
+      "p100": 3752
+    },
+    "dropped_token_percentiles": {
+      "p50": 15131,
+      "p75": 17350,
+      "p90": 39631,
+      "p95": 39631,
+      "p99": 39631,
+      "p100": 39631
+    }
+  },
+  "test": {
+    "kept": 949,
+    "dropped": 14,
+    "kept_token_percentiles": {
+      "p50": 1122,
+      "p75": 1331,
+      "p90": 1613,
+      "p95": 1863,
+      "p99": 2717,
+      "p100": 4080
+    },
+    "dropped_token_percentiles": {
+      "p50": 11745,
+      "p75": 19499,
+      "p90": 33859,
+      "p95": 34791,
+      "p99": 34791,
+      "p100": 34791
+    }
+  }
+}

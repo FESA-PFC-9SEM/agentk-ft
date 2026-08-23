@@ -75,6 +75,83 @@ def test_build_survives_malformed_image_without_crashing(tmp_path):
     assert diagnostic["usable_canonical_docs"] == 1
 
 
+def test_build_multi_defect_strategy_emits_multi_finding_examples(tmp_path):
+    # End-to-end smoke test for --strategy multi-defect: every emitted
+    # positive example must carry 2+ findings, and every patch must still
+    # round-trip (build() raises on a round-trip failure, so just not
+    # raising already proves that -- we additionally check the finding
+    # counts and the diagnostic's defect_count_distribution).
+    docs = [
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": f"d{i}"},
+            "spec": {
+                "selector": {"matchLabels": {"app": f"web{i}"}},
+                "template": {
+                    "metadata": {"labels": {"app": f"web{i}"}},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "app",
+                                "image": f"myapp{i}:1.2.3",
+                                "ports": [{"containerPort": 8080}],
+                                "livenessProbe": {"httpGet": {"path": "/", "port": 8080}},
+                                "resources": {
+                                    "requests": {"cpu": "100m", "memory": "64Mi"},
+                                    "limits": {"cpu": "200m", "memory": "128Mi"},
+                                },
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+        for i in range(20)
+    ]
+
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    repos = [f"repo{i}" for i in range(len(docs))]
+    df = pd.DataFrame(
+        {
+            "content": [json.dumps(d) for d in docs],
+            "max_stars_repo_name": repos,
+            "max_stars_repo_path": [f"{r}.yaml" for r in repos],
+        }
+    )
+    df.to_parquet(corpus_dir / "shard.parquet")
+
+    args = argparse.Namespace(
+        corpus_dir=str(corpus_dir),
+        synthetic_dir=None,
+        strategy="multi-defect",
+        min_defects=2,
+        max_defects=4,
+        output_dir=str(tmp_path / "output-multi-defect"),
+        limit=None,
+        total=15,
+        negative_ratio=0.2,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        seed=1,
+    )
+    diagnostic = build(args)
+
+    assert diagnostic["strategy"] == "multi-defect"
+    assert diagnostic["defect_count_distribution"]
+    assert all(count >= 2 for count in diagnostic["defect_count_distribution"])
+
+    path = tmp_path / "output-multi-defect" / "train.jsonl"
+    examples = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    positive_examples = [e for e in examples if json.loads(e["messages"][2]["content"])["findings"]]
+    assert positive_examples
+    for example in positive_examples:
+        findings = json.loads(example["messages"][2]["content"])["findings"]
+        assert len(findings) >= 2
+        assert len({f["rule_id"] for f in findings}) == len(findings)
+
+
 def test_build_skips_a_mutator_that_raises_assertion_error(tmp_path, monkeypatch):
     # Verifies build()'s defensive catch directly: a mutator raising
     # AssertionError (its own internal invariant failing on some document)

@@ -25,8 +25,12 @@ from unsloth import FastLanguageModel
 from unsloth.chat_templates import train_on_responses_only
 
 from finetune.metrics_logger import JsonlMetricsLogger
+from finetune.run_naming import generate_run_name
 
 import argparse
+import json
+import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -58,9 +62,9 @@ PRESETS = {
     # + defensive eval settings, all forced by tight VRAM (see the OOM
     # history in README.md's fine-tuning section).
     "4060ti": {
-        "model": "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
+        "model": "unsloth/Qwen2.5-Coder-3B-Instruct-bnb-4bit",
         "max_seq_length": 4096,
-        "batch_size": 4,
+        "batch_size": 8,
         "grad_accum": 4,
         "eval_batch_size": 1,
         "eval_accumulation_steps": 1,
@@ -104,7 +108,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=None)
     parser.add_argument("--data-dir", default="dataset/output/unsloth")
-    parser.add_argument("--output-dir", default="finetune/output")
+    parser.add_argument(
+        "--strategy",
+        choices=["single-defect", "multi-defect"],
+        default="single-defect",
+        help="which dataset generation strategy --data-dir was built with (see "
+        "README.md's 'Dataset generation strategies' section) -- labels the "
+        "auto-generated run folder name only, does not change training logic",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="defaults to an auto-generated runs/<timestamp>_<strategy>_<model>/ folder",
+    )
     parser.add_argument(
         "--preset",
         choices=sorted(PRESETS),
@@ -119,7 +135,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--eval-accumulation-steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--epochs", type=float, default=1)
+    parser.add_argument("--epochs", type=float, default=2)
     parser.add_argument("--eval-steps", type=int, default=None)
     parser.add_argument("--save-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -132,7 +148,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--metrics-file",
-        default="finetune/output/metrics.jsonl",
+        default=None,
         help="where to append training/eval metrics as JSONL (default: <output-dir>/metrics.jsonl)",
     )
     parser.add_argument("--logging-steps", type=int, default=10, help="how often to log train loss/lr")
@@ -142,11 +158,46 @@ def parse_args(argv=None) -> argparse.Namespace:
     for key, value in preset.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
+    if args.output_dir is None:
+        args.output_dir = str(Path("runs") / generate_run_name(args.strategy, args.model))
+    # Only the multi-defect strategy's default output path is distinctively
+    # named (dataset/output-multi-defect/...) -- single-defect's default
+    # (dataset/output/...) carries no marker at all, so only flag a mismatch
+    # when "multi-defect" appears where it shouldn't, or is missing where it
+    # should be. Not a hard failure: --data-dir can legitimately be a custom
+    # path that doesn't follow this naming convention.
+    data_dir_looks_multi = "multi-defect" in args.data_dir
+    if data_dir_looks_multi != (args.strategy == "multi-defect"):
+        print(
+            f"[WARNING] --strategy={args.strategy} but --data-dir={args.data_dir} looks like "
+            f"the other strategy's output -- double check you're pointing at the right dataset.",
+            file=sys.stderr,
+        )
     return args
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_info = {
+        "strategy": args.strategy,
+        "model": args.model,
+        "preset": args.preset,
+        "data_dir": args.data_dir,
+        "r": args.r,
+        "lora_alpha": args.lora_alpha,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "lr": args.lr,
+        "epochs": args.epochs,
+        "max_seq_length": args.max_seq_length,
+        "seed": args.seed,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (output_dir / "run_info.json").write_text(json.dumps(run_info, indent=2), encoding="utf-8")
+    print(f"Run folder: {output_dir}")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
@@ -170,7 +221,7 @@ def main(argv=None) -> None:
     if args.eval_limit is not None:
         eval_dataset = eval_dataset.select(range(min(args.eval_limit, len(eval_dataset))))
 
-    metrics_path = Path(args.metrics_file) if args.metrics_file else Path(args.output_dir) / "metrics.jsonl"
+    metrics_path = Path(args.metrics_file) if args.metrics_file else output_dir / "metrics.jsonl"
     metrics_logger = JsonlMetricsLogger(metrics_path)
 
     trainer = SFTTrainer(
@@ -228,7 +279,7 @@ def main(argv=None) -> None:
 
     trainer.train(resume_from_checkpoint=args.resume)
 
-    adapter_dir = Path(args.output_dir) / "lora_adapter"
+    adapter_dir = output_dir / "lora_adapter"
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
     print(f"LoRA adapter saved to {adapter_dir}")

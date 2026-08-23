@@ -193,19 +193,25 @@ def load_model(adapter_path: str, max_seq_length: int):
     return model, tokenizer
 
 
-def generate_response_text(model, tokenizer, system: str, user: str, max_new_tokens: int) -> str:
+def generate_response_text(
+    model,
+    tokenizer,
+    system: str,
+    user: str,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float | None = None,
+) -> str:
     import torch
 
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, pad_token_id=tokenizer.eos_token_id)
+    if do_sample and temperature is not None:
+        gen_kwargs["temperature"] = temperature
     with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        output_ids = model.generate(**inputs, **gen_kwargs)
     new_tokens = output_ids[0][inputs["input_ids"].shape[1] :]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 

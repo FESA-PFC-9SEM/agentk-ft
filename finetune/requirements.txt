@@ -34,3 +34,6 @@ accelerate==1.14.0
 # dataset/build.py uses, now applied to the model's own generated patch.
 jsonpatch>=1.33
 jsonpointer>=2.4
+
+# For finetune/run_scenarios.py's Excel report.
+openpyxl>=3.1

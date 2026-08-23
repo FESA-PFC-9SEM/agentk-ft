@@ -1,13 +1,23 @@
-finetune/output
+finetune/output*
 unsloth_compiled_cache/
+.ssh
+
+# Auto-generated training run history (finetune/train_unsloth.py's default
+# --output-dir) -- multi-GB checkpoints/adapters per run, same treatment as
+# finetune/output above, which this replaces as the default destination.
+runs/
 
 # Generated dataset/generation artifacts: large, fully reproducible via
 # pipeline.sh / dataset/build.py / finetune/export_for_unsloth.py, and some
 # exceed GitHub's 100MiB file limit uncompressed (dataset/output/unsloth/
 # train.jsonl is ~130MB). Compressed .jsonl.gz versions are committed
 # instead -- see scripts/compress_dataset.sh and scripts/decompress_dataset.sh.
+# dataset/output-multi-defect/ is the multi-defect strategy's parallel output
+# (see README.md's "Dataset generation strategies" section) -- same treatment.
 dataset/output/*.jsonl
 dataset/output/unsloth/*.jsonl
+dataset/output-multi-defect/*.jsonl
+dataset/output-multi-defect/unsloth/*.jsonl
 generation/output/*.jsonl
 
 # Byte-compiled / optimized / DLL files
