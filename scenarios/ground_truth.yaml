@@ -1,0 +1,71 @@
+# DRAFT ground truth for finetune/run_scenarios.py -- please review and
+# correct before relying on the results. This was pre-filled from a manual
+# read of each scenarios/*.yaml file, not computed by any detector.
+#
+# For each file:
+#   missing_image_tag:  true if ANY container in the file has no tag or ":latest"
+#   exposed_credentials: true if ANY plaintext secret/password/token/key is present
+#   typos: freeform list of semantic bugs/typos found by reading the file (wrong
+#     image name, misspelled path/command, selector/label mismatches, etc). Not
+#     scored automatically -- recorded so you can eyeball whether the model's
+#     "notes" caught them.
+
+1-orion.yaml:
+  missing_image_tag: true          # image: fiware/orion-ld (no tag)
+  exposed_credentials: true        # DB_PASSWORD, API_KEY env vars; -dbpwd 123456789 CLI arg
+  typos:
+    - "Service selector 'app: orionlds' does not match Deployment pod label 'app: orionld' (extra 's', breaks routing)"
+
+2-frontend.yaml:
+  missing_image_tag: true          # image: nginxs (no tag; also likely a typo for "nginx")
+  exposed_credentials: true        # PASSWORD_SERVICE_HOST value "123456" (weak/hardcoded)
+  typos:
+    - "image 'nginxs' looks like a typo of 'nginx' (php-redis container using an nginx-like name)"
+
+3-mysql.yaml:
+  missing_image_tag: true          # image: my-sql (no tag; also non-standard image name)
+  exposed_credentials: true        # MYSQL_ROOT_PASSWORD "mypassowrd 123", MYSQL_PASSWORD (two credentials)
+  typos:
+    - "MYSQL_ROOT_PASSWORD value 'mypassowrd 123' -- misspelled word and an embedded space"
+    - "image 'my-sql' is a non-standard/typo image name"
+
+4-vllm.yaml:
+  missing_image_tag: false         # image: python:3.9-slim (tag present)
+  exposed_credentials: true        # HUGGING_FACE_HUB_TOKEN, ADMIN_PASSWORD
+  typos:
+    - "command 'python5' does not exist (typo for 'python3')"
+
+5-nginx.yaml:
+  missing_image_tag: true          # RC image: ymqytw/nginxhttps (no tag)
+  exposed_credentials: true        # SSL_CERT_PASSWORD, DB_CONNECTION (connection string with embedded password)
+  typos:
+    - "command path '/hom/auto-reload-nginx.sh' -- typo for '/home/...'"
+    - "Service selector 'app: nginx' does not match RC pod label 'app: nginxs' (extra 's', breaks routing)"
+
+6-selenium.yaml:
+  missing_image_tag: true          # image: selenium/hub (no tag)
+  exposed_credentials: true        # GRID_HUB_PASSWORD, DATABASE_URL (connection string with embedded password)
+  typos:
+    - "Service selector 'app: sellenium-hub' does not match Deployment pod label 'app: selenium-hub' (extra 'l', breaks routing)"
+
+7-elasticsearch.yaml:
+  missing_image_tag: true          # RC image: quay.io/pires/docker-elasticsearch-kubernetes (no tag)
+  exposed_credentials: true        # ELASTIC_PASSWORD, KIBANA_PASSWORD
+  typos:
+    - "KUBERNETES_CA_CERTIFICATE_FILE value '/variavel/run/secrets/...' -- typo for '/var/run/secrets/...'"
+
+8-newrelic.yaml:
+  missing_image_tag: true          # image: newrelic/infrastructure (no tag)
+  exposed_credentials: true        # NEW_RELIC_LICENSE_KEY, API_SECRET
+  typos: []
+
+9-storm.yaml:
+  missing_image_tag: true          # image: storm (no tag)
+  exposed_credentials: true        # STORM_NIMBUS_PASSWORD
+  typos: []
+
+10-mongodb.yaml:
+  missing_image_tag: true          # image: mongo (no tag)
+  exposed_credentials: true        # MONGO_INITDB_ROOT_PASSWORD, MONGODB_URL (same password embedded again)
+  typos:
+    - "Service selector 'app: nonexistent-mongodb' does not match Deployment pod label 'app: mongodb-app' (breaks routing)"

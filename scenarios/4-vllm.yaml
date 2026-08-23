@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gemma-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma-server
+  template:
+    metadata:
+      labels:
+        app: gemma-server
+    spec:
+      containers:
+      - name: inference-server
+        image: python:3.9-slim
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m" 
+            memory: "256Mi"
+        command: ["python5", "-c"]
+        args:
+        - |
+          echo "Mock vLLM server for testing"
+          python3 -m http.server 8080
+        ports:
+        - containerPort: 8080
+        env:
+        - name: MODEL_ID
+          value: "mock-model-for-testing"
+        - name: HUGGING_FACE_HUB_TOKEN
+          value: "hf_hardcoded_token_abc123xyz"
+        - name: ADMIN_PASSWORD
+          value: "admin123!@#"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      volumes:
+      - name: dshm
+        emptyDir:
+            sizeLimit: "64Mi"

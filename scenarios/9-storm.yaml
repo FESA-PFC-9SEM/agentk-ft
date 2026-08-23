@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storm-worker-controller
+  labels:
+     name: storm-worker
+spec:
+  replicas: 1
+  selector:
+     matchLabels:
+        name: storm-worker
+        uses: nimbus
+  template:
+    metadata:
+      labels:
+        name: storm-worker
+        uses: nimbus
+    spec:
+      containers:
+      - name: storm-worker
+        image: storm
+        command: ["/bin/sh", "-c"]
+        args: ["echo 'Worker stub iniciado...'; while true; do sleep 3600; done"]
+        env:
+        - name: STORM_NIMBUS_PASSWORD
+          value: "storm-admin-123"
+        - name: STORM_NIMBUS
+          value: "nimbus.default.svc.cluster.local"
+        - name: STORM_ZOOKEEPER_SERVERS
+          value: "zookeeper.default.svc.cluster.local:2181"
+
+        resources:
+          limits:
+            cpu: 30m
+            memory: 20Mi
+          requests:
+            cpu: 30m
+            memory: 10Mi
+        ports:
+        - hostPort: 6700
+          containerPort: 6700
+        - hostPort: 6701
+          containerPort: 6701
+        - hostPort: 6702
+          containerPort: 6702
+        - hostPort: 6703
+          containerPort: 6703
