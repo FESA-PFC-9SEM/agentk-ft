@@ -12,6 +12,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+sudo apt-get update -y
+sudo apt-get upgrade -y
+sudo apt-get install -y tmux btop zip
+
 CUDA_INDEX="${CUDA_INDEX:-https://download.pytorch.org/whl/cu126}"
 
 if ! command -v uv >/dev/null 2>&1; then
