@@ -94,16 +94,16 @@
     "positive": 6500,
     "negative": 3500
   },
-  "mutation_precondition_failures": 34,
+  "mutation_precondition_failures": 79,
   "examples_emitted": {
-    "train": 8045,
-    "val": 992,
-    "test": 963,
+    "train": 8062,
+    "val": 986,
+    "test": 952,
     "total": 10000
   },
   "defect_count_distribution": {
-    "2": 2197,
-    "3": 2755,
-    "4": 1548
+    "2": 2137,
+    "3": 2160,
+    "4": 2203
   }
 }

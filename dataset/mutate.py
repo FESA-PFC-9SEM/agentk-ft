@@ -204,11 +204,130 @@ _CLI_INJECTION_TEMPLATES = (
 # Probability of attempting the env-var injection first (vs. command/args).
 _ENV_VARIANT_PROBABILITY = 0.7
 
+# --- Realistic fake-secret-value shapes ---------------------------------
+#
+# A model trained only on random_alnum's fixed-shape output (letters+digits,
+# always 20 chars) can learn "flag this exact literal shape" instead of the
+# intended "flag anything assigned to a credential-shaped key" -- confirmed
+# in practice: a real manifest's password ("mypassowrd 123" -- unquoted,
+# space, misspelled word + digits) was missed by a model trained this way,
+# while a differently-shaped fake password during manual testing was caught
+# fine. These pools add format diversity (word-based, keyboard walks,
+# well-known-weak shapes, messy/typo'd, connection-string-embedded) without
+# using any real leaked-credential data -- see README.md's design decisions
+# for why a real breach wordlist (e.g. rockyou.txt) was deliberately not
+# used: real people's actual leaked passwords aren't necessary here, only
+# format diversity is, which is a much smaller and uncomplicated thing to
+# synthesize from scratch. None of these words/phrases are drawn from any
+# breach corpus.
+_COMMON_WEAK_WORDS = (
+    "summer", "winter", "spring", "autumn", "dragon", "tiger", "shadow",
+    "phoenix", "falcon", "admin", "welcome", "sunshine", "football",
+    "baseball", "monkey", "cookie", "hunter", "master", "ninja", "wizard",
+    "eagle", "thunder", "matrix", "rocket", "silver", "golden",
+)
 
-def _fake_secret_value(rng: random.Random, length: int = 20) -> str:
-    """Generates a synthetic value shaped like a secret. Never a real
-    credential -- just a plausible literal for training pattern detection."""
+# Well-known keyboard-walk strings -- a distinct, generic weak-password
+# shape (adjacent-key sequences), not tied to any breach corpus.
+_KEYBOARD_WALKS = ("qwerty", "asdfgh", "zxcvbn", "1qaz2wsx", "qazwsx", "1q2w3e4r")
+
+# Generic weak-password *shapes*, illustrative only -- verified below (see
+# test_mutate.py) to never exactly equal (case-insensitive, whole-string) any
+# scanning.PLACEHOLDER_RE alternative, since that would make find_secrets
+# skip it as a placeholder instead of flagging it.
+_KNOWN_WEAK_PASSWORDS = (
+    "Passw0rd!", "Welcome1", "Admin123", "Qwerty123", "Sunshine1",
+    "Football1", "Monkey123", "Dragon99",
+)
+
+# Symbols safe to append even inside a CLI flag/basic-auth URL value -- "@"
+# is deliberately excluded there (it would terminate BASIC_AUTH_URL_RE's
+# capture early in scanning.py). The env-variant path has no such
+# constraint (detection there doesn't regex-parse the value at all).
+_SYMBOLS_CLI_SAFE = "!#$%^&*"
+_SYMBOLS = _SYMBOLS_CLI_SAFE + "@"
+
+_CONN_SCHEMES = ("postgres", "mysql", "mongodb", "redis", "amqp")
+_CONN_USERS = ("admin", "root", "app", "user")
+_CONN_HOSTS = ("db", "database", "localhost", "db-service", "mongodb-service")
+_CONN_PORTS = (5432, 3306, 27017, 6379, 5672)
+_CONN_DBS = ("app", "mydb", "prod", "data")
+
+
+def _random_alnum_value(rng: random.Random, length: int | None = None) -> str:
+    length = length if length is not None else rng.randint(12, 32)
     return "".join(rng.choices(_SECRET_CHARSET, k=length))
+
+
+def _word_based_value(rng: random.Random, cli_safe: bool) -> str:
+    word = rng.choice(_COMMON_WEAK_WORDS)
+    word = word.capitalize() if rng.random() < 0.5 else word
+    digits = "".join(rng.choices(string.digits, k=rng.randint(1, 4)))
+    symbols = _SYMBOLS_CLI_SAFE if cli_safe else _SYMBOLS
+    suffix = rng.choice(symbols) if rng.random() < 0.4 else ""
+    return f"{word}{digits}{suffix}"
+
+
+def _keyboard_walk_value(rng: random.Random) -> str:
+    base = rng.choice(_KEYBOARD_WALKS)
+    return base if rng.random() < 0.5 else base + str(rng.randint(0, 99))
+
+
+def _known_weak_value(rng: random.Random) -> str:
+    return rng.choice(_KNOWN_WEAK_PASSWORDS)
+
+
+def _messy_value(rng: random.Random) -> str:
+    """Mimics a real-world messy credential value: a (possibly typo'd) word
+    plus digits, separated by a space -- e.g. the exact shape of a real
+    manifest's "mypassowrd 123". Only used where the caller doesn't need the
+    value to survive being embedded inside a regex-parsed CLI flag/URL."""
+    word = rng.choice(_COMMON_WEAK_WORDS)
+    if rng.random() < 0.5:
+        word = _typo(word, rng)
+    digits = "".join(rng.choices(string.digits, k=rng.randint(1, 3)))
+    return f"{word} {digits}"
+
+
+def _connection_string_value(rng: random.Random) -> str:
+    """A full connection-string value (scheme://user:pass@host:port/db),
+    matching scanning.CONN_STRING_RE independent of the env var's key name --
+    real manifests routinely put this shape under keys like DATABASE_URL or
+    DB_CONNECTION, which mutate.py never generated as a plain env value
+    before (the only near-equivalent was one of four CLI-injection
+    templates, a different and much rarer code path). The password
+    component reuses the cli_safe pool so it can never contain ':'/'@'/'/'
+    itself, keeping the whole value matching CONN_STRING_RE from position 0."""
+    scheme = rng.choice(_CONN_SCHEMES)
+    user = rng.choice(_CONN_USERS)
+    host = rng.choice(_CONN_HOSTS)
+    port = rng.choice(_CONN_PORTS)
+    db = rng.choice(_CONN_DBS)
+    password = _fake_secret_value(rng, cli_safe=True)
+    return f"{scheme}://{user}:{password}@{host}:{port}/{db}"
+
+
+def _fake_secret_value(rng: random.Random, length: int | None = None, cli_safe: bool = False) -> str:
+    """Generates a synthetic value shaped like a secret. Never a real
+    credential -- just a plausible literal for training pattern detection.
+
+    cli_safe=True restricts to shapes with no whitespace/'@'//'/quotes, for
+    values that get embedded inside a longer CLI flag or basic-auth URL
+    string and matched by a regex there (see scanning.py's CLI_FLAG_CRED_RE/
+    BASIC_AUTH_URL_RE) -- a space or stray '@' would truncate that capture.
+    cli_safe=False (the env-var variant's case) has no such constraint, so it
+    additionally allows the space-containing "messy" and connection-string
+    styles."""
+    styles = [
+        lambda: _random_alnum_value(rng, length),
+        lambda: _word_based_value(rng, cli_safe),
+        lambda: _keyboard_walk_value(rng),
+        lambda: _known_weak_value(rng),
+    ]
+    if not cli_safe:
+        styles.append(lambda: _messy_value(rng))
+        styles.append(lambda: _connection_string_value(rng))
+    return rng.choice(styles)()
 
 
 def _mutate_ksec001_env(
@@ -310,7 +429,7 @@ def _mutate_ksec001_command(canonical_doc: dict, rng: random.Random, doc_index: 
     m_pod_spec, _ = get_pod_spec(mutated_doc)
     _, m_container = list(iter_containers(m_pod_spec, prefix))[container_idx]
 
-    fake = _fake_secret_value(rng)
+    fake = _fake_secret_value(rng, cli_safe=True)
     template = rng.choice(_CLI_INJECTION_TEMPLATES)
     injected_string = template(fake)
 

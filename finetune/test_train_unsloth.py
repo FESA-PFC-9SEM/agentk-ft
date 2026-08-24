@@ -13,6 +13,7 @@ from finetune.train_unsloth import PRESETS, load_jsonl_as_dataset, parse_args
 
 
 _SEVEN_B = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+_THREE_B = "unsloth/Qwen2.5-Coder-3B-Instruct-bnb-4bit"
 
 
 def test_load_jsonl_as_dataset_reads_all_rows(tmp_path):
@@ -31,9 +32,9 @@ def test_load_jsonl_as_dataset_reads_all_rows(tmp_path):
 def test_default_preset_is_4060ti_and_matches_current_hardcoded_values():
     args = parse_args([])
     assert args.preset == "4060ti"
-    assert args.model == _SEVEN_B
+    assert args.model == _THREE_B
     assert args.max_seq_length == 4096
-    assert args.batch_size == 4
+    assert args.batch_size == 8
     assert args.grad_accum == 4
     assert args.eval_batch_size == 1
     assert args.eval_accumulation_steps == 1
@@ -97,7 +98,7 @@ def test_non_hardware_params_are_not_preset_controlled():
     assert default_args.r == a100_args.r == 16
     assert default_args.lora_alpha == a100_args.lora_alpha == 32
     assert default_args.lr == a100_args.lr == 2e-4
-    assert default_args.epochs == a100_args.epochs == 1
+    assert default_args.epochs == a100_args.epochs == 2
 
 
 def test_invalid_preset_rejected():

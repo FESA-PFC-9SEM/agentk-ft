@@ -6,6 +6,7 @@ import pytest
 from dataset.mutate import (
     FAKE_SECRET_VAR_NAMES,
     MUTATORS,
+    _fake_secret_value,
     _mutate_ksec001_command,
     _mutate_ksec001_env,
     _typo,
@@ -19,6 +20,7 @@ from dataset.mutate import (
     mutate_ksec008,
     mutate_ksec009,
 )
+from dataset.scanning import CONN_STRING_RE, PLACEHOLDER_RE, find_secrets
 
 
 def _apply_patch(mutated_doc, patch):
@@ -211,6 +213,78 @@ def test_ksec001_dispatcher_forwards_candidate_names_to_env_variant():
         if result.new_resources:  # env variant fired
             injected_name = result.mutated_doc["spec"]["containers"][0]["env"][0]["name"]
             assert injected_name == "MY_CUSTOM_SECRET"
+
+
+def test_fake_secret_value_never_matches_placeholder_regardless_of_style():
+    for seed in range(500):
+        rng = random.Random(seed)
+        value = _fake_secret_value(rng, cli_safe=seed % 2 == 0)
+        assert len(value) >= 4
+        assert not PLACEHOLDER_RE.match(value.strip())
+
+
+def test_fake_secret_value_cli_safe_has_no_regex_breaking_characters():
+    for seed in range(500):
+        rng = random.Random(seed)
+        value = _fake_secret_value(rng, cli_safe=True)
+        assert " " not in value
+        assert "@" not in value
+        assert "/" not in value
+        assert "'" not in value
+        assert '"' not in value
+
+
+def test_fake_secret_value_messy_style_is_reachable_and_still_detected():
+    # Regression test for the sql.yaml gap: a space-containing, word-based
+    # value must (a) actually be reachable from the env-variant's style pool
+    # and (b) still be flagged by scanning.find_secrets once placed under a
+    # sensitive key, exactly like the real manifest's "mypassowrd 123".
+    found_messy = False
+    for seed in range(500):
+        rng = random.Random(seed)
+        value = _fake_secret_value(rng, cli_safe=False)
+        if " " in value and "://" not in value:
+            found_messy = True
+            doc = _pod({"env": [{"name": "DB_PASSWORD", "value": value}]})
+            hits = find_secrets(doc)
+            assert any(h.value == value for h in hits)
+    assert found_messy
+
+
+def test_fake_secret_value_connection_string_style_is_reachable_and_detected():
+    # Regression test for the "credentials embedded in a URL" gap: a plain
+    # env value shaped like scheme://user:pass@host:port/db (e.g. a real
+    # DATABASE_URL/DB_CONNECTION) must be reachable and caught by
+    # scanning.py's CONN_STRING_RE path, independent of the key name.
+    found_conn_string = False
+    for seed in range(500):
+        rng = random.Random(seed)
+        value = _fake_secret_value(rng, cli_safe=False)
+        if "://" in value:
+            found_conn_string = True
+            assert CONN_STRING_RE.match(value)
+            doc = _pod({"env": [{"name": "DATABASE_URL", "value": value}]})
+            hits = find_secrets(doc)
+            assert any(h.reason == "connection string with embedded credentials" for h in hits)
+    assert found_conn_string
+
+
+@pytest.mark.parametrize("seed", range(100))
+def test_ksec001_env_round_trip_across_many_seeds_and_styles(seed):
+    rng = random.Random(seed)
+    result = _mutate_ksec001_env(_pod(), rng, 0)
+    assert result is not None
+    assert result.findings
+    _assert_round_trip(result)
+
+
+@pytest.mark.parametrize("seed", range(100))
+def test_ksec001_command_round_trip_across_many_seeds_and_styles(seed):
+    rng = random.Random(seed)
+    result = _mutate_ksec001_command(_pod(), rng, 0)
+    assert result is not None
+    assert result.findings
+    _assert_round_trip(result)
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,16 @@ from dataset.detect import detect_all
 from dataset.mutate import MUTATORS
 from dataset.schema import Finding, PatchOp, RULE_IDS
 
+# How many times the SAME rule can fire in one example -- e.g. two separate
+# plaintext credentials (KSEC-001 twice), matching a real manifest that had
+# exactly that shape (two passwords in one Pod) and which a model trained
+# only on "each rule at most once" examples missed the second finding on.
+# Each mutator's own precondition (an existing var name excluded for
+# KSEC-001's env variant, an AssertionError for the hard-precondition rules
+# once their target area is already dirty) naturally caps how many times a
+# repeat can actually succeed on a given document.
+MAX_REPEATS_PER_RULE = 2
+
 
 @dataclass
 class MultiMutationResult:
@@ -43,17 +53,20 @@ def mutate_multi_defect(
     max_defects: int = 4,
     ksec001_candidate_names=None,
 ) -> MultiMutationResult | None:
-    """Injects between min_defects and max_defects simultaneous, independent
-    defects into canonical_doc. Returns None if the doc isn't a usable base
-    (already dirty) or if fewer than min_defects mutators turned out to be
-    applicable (e.g. the doc has only one container)."""
+    """Injects between min_defects and max_defects simultaneous defects
+    (findings, not necessarily distinct rule types -- the same rule can fire
+    more than once, up to MAX_REPEATS_PER_RULE, e.g. two separate plaintext
+    credentials) into canonical_doc. Returns None if the doc isn't a usable
+    base (already dirty) or if fewer than min_defects mutations turned out to
+    be applicable (e.g. the doc has only one container)."""
     existing = [f for f in detect_all(canonical_doc, doc_index) if f.rule_id in RULE_IDS]
     if existing:
         return None
 
-    target_count = rng.randint(min_defects, min(max_defects, len(MUTATORS)))
-    rule_ids = list(MUTATORS)
-    rng.shuffle(rule_ids)
+    max_possible = len(MUTATORS) * MAX_REPEATS_PER_RULE
+    target_count = rng.randint(min_defects, min(max_defects, max_possible))
+    rule_pool = list(MUTATORS) * MAX_REPEATS_PER_RULE
+    rng.shuffle(rule_pool)
 
     current_doc = canonical_doc
     running_canonical = copy.deepcopy(canonical_doc)
@@ -61,14 +74,21 @@ def mutate_multi_defect(
     patch: list[PatchOp] = []
     new_resources: list[str] = []
 
-    for rule_id in rule_ids:
+    for rule_id in rule_pool:
         if len(applied_rule_ids) >= target_count:
             break
         mutator = MUTATORS[rule_id]
-        if rule_id == "KSEC-001":
-            result = mutator(current_doc, rng, doc_index, candidate_names=ksec001_candidate_names)
-        else:
-            result = mutator(current_doc, rng, doc_index)
+        try:
+            if rule_id == "KSEC-001":
+                result = mutator(current_doc, rng, doc_index, candidate_names=ksec001_candidate_names)
+            else:
+                result = mutator(current_doc, rng, doc_index)
+        except AssertionError:
+            # A repeat attempt whose precondition no longer holds (e.g. this
+            # rule already fired on the only container it could target) --
+            # skip it like any other inapplicable attempt, rather than
+            # aborting the whole composition over one exhausted rule.
+            continue
         if result is None:
             continue
         # Undoing N chained mutations means undoing the most recent one

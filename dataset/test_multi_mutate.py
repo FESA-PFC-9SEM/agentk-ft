@@ -52,7 +52,6 @@ def test_round_trip_holds_for_a_multi_defect_composition():
 
     assert result is not None
     assert 2 <= len(result.applied_rule_ids) <= 4
-    assert len(set(result.applied_rule_ids)) == len(result.applied_rule_ids)  # no rule applied twice
     assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
 
 
@@ -137,6 +136,77 @@ def test_round_trip_holds_when_ksec001_env_variant_adds_a_new_field():
         assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
 
     assert found_ksec001
+
+
+def _pod_with_two_containers():
+    """Two containers, each independently eligible for a fresh KSEC-001
+    injection (no pre-existing env), each with its own securityContext-free,
+    pinned-image, matching-selector setup."""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "d"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "web"}},
+            "template": {
+                "metadata": {"labels": {"app": "web"}},
+                "spec": {
+                    "containers": [
+                        {"name": "app", "image": "myapp:1.2.3"},
+                        {"name": "sidecar", "image": "sidecar:1.0.0"},
+                    ]
+                },
+            },
+        },
+    }
+
+
+def test_same_rule_can_fire_twice_across_multiple_containers():
+    # Regression test for the original sql.yaml gap: a manifest can have TWO
+    # separate plaintext credentials, not just two different rule types.
+    doc = _pod_with_two_containers()
+    found_two_ksec001 = False
+    for seed in range(200):
+        result = mutate_multi_defect(doc, random.Random(seed), min_defects=2, max_defects=6)
+        if result is not None and result.applied_rule_ids.count("KSEC-001") >= 2:
+            found_two_ksec001 = True
+            assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+            assert sum(1 for f in result.findings if f.rule_id == "KSEC-001") >= 2
+            break
+    assert found_two_ksec001
+
+
+def test_same_rule_can_fire_twice_on_the_same_single_container():
+    # Matches sql.yaml's exact shape: ONE container, two separate
+    # credentials (e.g. MYSQL_ROOT_PASSWORD and MYSQL_PASSWORD).
+    # _rich_deployment has exactly one container, so any doubled KSEC-001
+    # here necessarily lands on that same container.
+    doc = _rich_deployment()
+    found_two_ksec001 = False
+    for seed in range(300):
+        result = mutate_multi_defect(doc, random.Random(seed), min_defects=2, max_defects=6)
+        if result is not None and result.applied_rule_ids.count("KSEC-001") >= 2:
+            found_two_ksec001 = True
+            assert sum(1 for f in result.findings if f.rule_id == "KSEC-001") >= 2
+            assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+            env = result.mutated_doc["spec"]["template"]["spec"]["containers"][0].get("env")
+            if env:  # only meaningful when at least one hit was the env-variant
+                names = [e["name"] for e in env]
+                assert len(names) == len(set(names))  # distinct credential names, same container
+            break
+    assert found_two_ksec001
+
+
+def test_repeat_attempt_on_exhausted_hard_precondition_rule_is_skipped_not_fatal():
+    # _rich_deployment has exactly one container -- once KSEC-002 fires once,
+    # a second attempt hits mutate_ksec002's "assert not detect_ksec002(...)"
+    # precondition. That must be caught and skipped, not blow up the whole
+    # composition.
+    doc = _rich_deployment()
+    for seed in range(200):
+        result = mutate_multi_defect(doc, random.Random(seed), min_defects=2, max_defects=6)
+        if result is not None:
+            assert result.applied_rule_ids.count("KSEC-002") <= 1
 
 
 def test_multiple_runs_produce_varied_rule_combinations():
