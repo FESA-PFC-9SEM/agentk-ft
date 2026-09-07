@@ -54,6 +54,11 @@ def format_row(r: dict) -> str:
 
 
 def run(args: argparse.Namespace) -> list[dict]:
+    # unsloth must be imported before trl/transformers/peft -- it patches
+    # them at import time, and importing trl first (as this used to do)
+    # triggers Unsloth's own "should be imported before" warning and skips
+    # some of its speed optimizations. Same ordering as train_unsloth.py.
+    import unsloth  # noqa: F401
     import torch
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
