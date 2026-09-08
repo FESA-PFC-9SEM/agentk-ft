@@ -14,13 +14,32 @@ def test_format_row_success():
         "effective_batch": 32,
         "samples_per_second": 1.234,
         "steps_per_second": 0.0386,
+        "tokens_per_second": 1580.5,
         "peak_vram_gb": 6.71,
         "oom": False,
     }
     text = format_row(row)
     assert "8" in text and "4" in text and "32" in text
     assert "1.234" in text
+    assert "1580.5" in text
     assert "6.71" in text
+
+
+def test_format_row_missing_tokens_per_second():
+    # e.g. include_num_input_tokens_seen didn't produce a usable count --
+    # must degrade gracefully, not crash on a None value.
+    row = {
+        "batch_size": 8,
+        "grad_accum": 4,
+        "effective_batch": 32,
+        "samples_per_second": 1.234,
+        "steps_per_second": 0.0386,
+        "tokens_per_second": None,
+        "peak_vram_gb": 6.71,
+        "oom": False,
+    }
+    text = format_row(row)
+    assert "n/a" in text
 
 
 def test_format_row_oom():

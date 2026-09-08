@@ -1,11 +1,19 @@
 """
-Benchmarks training throughput (samples/sec, steps/sec, peak VRAM) across
-combinations of --batch-size and --grad-accum, to find the sweet spot on the
-current GPU for this project's model/dataset. Each combo runs a short burst
-of real training steps (no eval, no checkpointing, no load_best_model_at_end
--- none of that is representative of pure throughput and just adds time), on
-the actual training data so sequence-length distribution matches a real run.
-A combo that hits CUDA OOM is recorded and skipped, not fatal to the sweep.
+Benchmarks training throughput (samples/sec, steps/sec, tokens/sec, peak
+VRAM) across combinations of --batch-size and --grad-accum, to find the
+sweet spot on the current GPU for this project's model/dataset. Each combo
+runs a short burst of real training steps (no eval, no checkpointing, no
+load_best_model_at_end -- none of that is representative of pure throughput
+and just adds time), on the actual training data so sequence-length
+distribution matches a real run. A combo that hits CUDA OOM is recorded and
+skipped, not fatal to the sweep.
+
+tokens/sec counts every input token including padding (dynamic per-batch,
+not padded to --max-seq-length) -- that's what the GPU actually computes
+over, so it's the most literal throughput reading. It's computed by hand
+from SFTConfig's include_num_input_tokens_seen=True (num_input_tokens_seen /
+train_runtime): this installed Trainer version tracks the token count but
+doesn't itself divide it into a final train_tokens_per_second metric.
 
 The model is loaded once and reused across every combo -- LoRA weights drift
 a little between short bursts, but that doesn't matter here: only step time
@@ -47,9 +55,12 @@ def parse_combo(s: str) -> tuple[int, int]:
 def format_row(r: dict) -> str:
     if r["oom"]:
         return f"{r['batch_size']:>6} {r['grad_accum']:>6} {r['effective_batch']:>5} {'OOM':>12}"
+    tokens_per_second = r.get("tokens_per_second")
+    tokens_str = f"{tokens_per_second:>10.1f}" if tokens_per_second is not None else f"{'n/a':>10}"
     return (
         f"{r['batch_size']:>6} {r['grad_accum']:>6} {r['effective_batch']:>5} "
-        f"{r['samples_per_second']:>10.3f} {r['steps_per_second']:>8.3f} {r['peak_vram_gb']:>10.2f}GB"
+        f"{r['samples_per_second']:>10.3f} {r['steps_per_second']:>8.3f} {tokens_str} "
+        f"{r['peak_vram_gb']:>10.2f}GB"
     )
 
 
@@ -113,6 +124,12 @@ def run(args: argparse.Namespace) -> list[dict]:
                     save_strategy="no",
                     report_to="none",
                     seed=42,
+                    # Needed for tokens/sec below -- this installed Trainer
+                    # version tracks num_input_tokens_seen (incl. padding)
+                    # but doesn't itself divide it into a final
+                    # train_tokens_per_second metric, so that's computed
+                    # by hand from num_input_tokens_seen / train_runtime.
+                    include_num_input_tokens_seen=True,
                 ),
             )
             trainer = train_on_responses_only(
@@ -123,12 +140,16 @@ def run(args: argparse.Namespace) -> list[dict]:
             train_output = trainer.train()
             metrics = train_output.metrics
             peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9
+            tokens_seen = metrics.get("num_input_tokens_seen")
+            runtime = metrics.get("train_runtime")
+            tokens_per_second = tokens_seen / runtime if tokens_seen and runtime else None
             result = {
                 "batch_size": batch_size,
                 "grad_accum": grad_accum,
                 "effective_batch": effective,
                 "samples_per_second": metrics.get("train_samples_per_second"),
                 "steps_per_second": metrics.get("train_steps_per_second"),
+                "tokens_per_second": round(tokens_per_second, 1) if tokens_per_second else None,
                 "peak_vram_gb": round(peak_vram_gb, 2),
                 "oom": False,
             }
@@ -141,6 +162,7 @@ def run(args: argparse.Namespace) -> list[dict]:
                 "effective_batch": effective,
                 "samples_per_second": None,
                 "steps_per_second": None,
+                "tokens_per_second": None,
                 "peak_vram_gb": None,
                 "oom": True,
             }
@@ -151,7 +173,10 @@ def run(args: argparse.Namespace) -> list[dict]:
         gc.collect()
 
     print("\n=== Summary ===")
-    print(f"{'batch':>6} {'accum':>6} {'eff':>5} {'samples/s':>10} {'steps/s':>8} {'peak VRAM':>12}")
+    print(
+        f"{'batch':>6} {'accum':>6} {'eff':>5} {'samples/s':>10} {'steps/s':>8} "
+        f"{'tokens/s':>10} {'peak VRAM':>12}"
+    )
     for r in results:
         print(format_row(r))
 
