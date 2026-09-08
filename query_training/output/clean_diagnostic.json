@@ -1,0 +1,74 @@
+{
+  "sources": [
+    "kubectl-command-csv"
+  ],
+  "target_format": "command",
+  "corpus_dir": "query_training/corpus",
+  "raw_rows": 19661,
+  "raw_by_source": {
+    "kubectl-command-csv": 19661
+  },
+  "kept": 18351,
+  "kept_fraction": 0.9334,
+  "kept_with_cot": 18351,
+  "kept_by_source": {
+    "kubectl-command-csv": 18351
+  },
+  "read_only": false,
+  "on_conflict": "first",
+  "drops": {
+    "conflict_minority": 1001,
+    "not_kubectl": 240,
+    "not_single_command": 69,
+    "exact_duplicate": 0
+  },
+  "split_sizes": {
+    "test": 917,
+    "val": 917,
+    "train": 16517
+  },
+  "distinct_commands": 18321,
+  "verb_histogram": {
+    "port-forward": 2875,
+    "create": 2556,
+    "set": 1671,
+    "config": 1308,
+    "logs": 1281,
+    "exec": 1086,
+    "taint": 1036,
+    "get": 933,
+    "annotate": 791,
+    "run": 684,
+    "label": 498,
+    "attach": 454,
+    "delete": 437,
+    "expose": 374,
+    "scale": 339,
+    "debug": 324,
+    "cp": 310,
+    "auth": 290,
+    "autoscale": 213,
+    "patch": 178,
+    "rollout": 164,
+    "apply": 90,
+    "top": 80,
+    "describe": 71,
+    "edit": 49,
+    "api-resources": 43,
+    "certificate": 40,
+    "explain": 36,
+    "proxy": 27,
+    "wait": 22,
+    "replace": 18,
+    "cordon": 16,
+    "uncordon": 15,
+    "cluster-info": 13,
+    "diff": 10,
+    "kustomize": 8,
+    "drain": 8,
+    "api-versions": 1,
+    "options": 1,
+    "version": 1
+  },
+  "seed": 42
+}

@@ -1,0 +1,37 @@
+{
+  "max_seq_length": 1024,
+  "token_counting_method": "unsloth/Qwen2.5-Coder-1.5B-Instruct-bnb-4bit",
+  "train": {
+    "kept": 16517,
+    "dropped": 0,
+    "kept_token_percentiles": {
+      "p50": 117,
+      "p90": 132,
+      "p95": 136,
+      "p99": 153,
+      "p100": 160
+    }
+  },
+  "val": {
+    "kept": 917,
+    "dropped": 0,
+    "kept_token_percentiles": {
+      "p50": 116,
+      "p90": 132,
+      "p95": 136,
+      "p99": 154,
+      "p100": 157
+    }
+  },
+  "test": {
+    "kept": 917,
+    "dropped": 0,
+    "kept_token_percentiles": {
+      "p50": 117,
+      "p90": 132,
+      "p95": 136,
+      "p99": 154,
+      "p100": 158
+    }
+  }
+}

@@ -1,0 +1,4 @@
+# HF dataset repo: <fill in — the one you ran `hf download` on>
+Schema: objective, question, command, description, syntax, flags, chain_of_thought (19,661 rows).
+Structured member of the dereklck kubectl-query family. `question` is the concrete phrasing that matches `command`; every row has a chain_of_thought.
+PRIMARY source for query_training — see query_training/sources.py. Its `command` column is a strict superset of cli_queries_1/ `output`.

@@ -20,6 +20,16 @@ dataset/output-multi-defect/*.jsonl
 dataset/output-multi-defect/unsloth/*.jsonl
 generation/output/*.jsonl
 
+# kubectl-query task (query_training/): generated splits + auto-named training
+# runs, same treatment as the manifest-security task above. Fully reproducible
+# via query_training/pipeline.sh from query_training/corpus/.
+query_training/output/*.jsonl
+query_training/output/unsloth/*.jsonl
+query_training/output/eval/
+query_training/runs/
+# HuggingFace snapshot bookkeeping that `hf download` recreates on demand.
+query_training/corpus/**/.cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

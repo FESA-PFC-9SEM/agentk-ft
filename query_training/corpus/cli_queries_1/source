@@ -1,0 +1,3 @@
+https://huggingface.co/datasets/dereklck/kubernetes_cli_dataset_20k
+Schema: instruction, type, output (19,661 rows). The original flat dataset.
+NOT USED by the pipeline: its `output` command set is byte-identical to kubernetes-kubectl-command-dataset/`command`, which also carries question/CoT/flags. Kept only as a raw mirror.

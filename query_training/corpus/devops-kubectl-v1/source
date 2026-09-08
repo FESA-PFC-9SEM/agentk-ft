@@ -1,0 +1,3 @@
+# HF dataset repo: <fill in — the one you ran `hf download` on>
+Schema: prompt, response (34,535 train + 349 test). The command is inside a ```bash``` fence in `response`; the rest of `response` is generic per-command boilerplate and is discarded by the loader.
+OPTIONAL extra surface variety: SOURCES=kubectl-command-csv,devops-kubectl. Heavy objective/command overlap with kubernetes-kubectl-command-dataset (cross-source de-dup in clean.py removes ~19k dupes); no chain_of_thought, so it contributes nothing under --target-format plan-command.
