@@ -17,6 +17,8 @@ dataset only — no training happens here.
   - [Part B — `generation/`](#part-b--generation)
 - [Pipeline flow](#pipeline-flow)
 - [Dataset generation strategies](#dataset-generation-strategies)
+- [Real-world testing](#real-world-testing)
+- [Benchmarking training throughput](#benchmarking-training-throughput)
 - [Setup](#setup)
 - [Usage](#usage)
 - [Testing](#testing)
@@ -264,6 +266,38 @@ that module's docstring for why this composition is safe (each rule injects
 into a disjoint structural area, so injecting rule B never dirties rule A's
 already-injected field).
 
+**The same rule can fire more than once in one example** (`MAX_REPEATS_PER_RULE`,
+currently 2) — e.g. two separate plaintext credentials in one manifest, not
+just two different rule types. This closes the *actual* original gap: a
+real manifest (`scenarios/3-mysql.yaml`) has two passwords, and the first
+version of the multi-defect dataset could still only ever compose *different*
+rules together, never the same one twice. Each repeat attempt is wrapped in
+its own `try/except AssertionError`, so a rule that's already exhausted its
+eligible targets in a document (e.g. only one container left to flag) is
+skipped like any other inapplicable attempt rather than aborting the whole
+example.
+
+**`dataset/mutate.py::_fake_secret_value()` produces format-diverse values**,
+not just fixed-length alphanumeric strings. A model trained only on
+`letters+digits, always 20 chars` learned to recognize that exact shape
+rather than the general concept "this is a plaintext credential" — confirmed
+by a real miss (`mypassowrd 123`, an unquoted, typo'd, space-containing real
+value) that a differently-shaped *fake* password during manual testing
+didn't trip up. The generator now draws from: random alphanumeric (variable
+length), word+digits+symbol (`Summer2024!`), keyboard walks (`qwerty123`),
+well-known weak-password shapes (`Passw0rd!`), a "messy" style reusing the
+existing typo helper (`sunshien 3`), and full connection strings
+(`postgres://user:pass@host:port/db`) — the last of these closing a second
+gap, where a plain env value shaped like a connection string was essentially
+unrepresented in training despite `scanning.py`'s `CONN_STRING_RE` already
+being able to catch it independent of the key name. None of these are drawn
+from a real leaked-password corpus (e.g. rockyou.txt) — deliberately: real
+breach data isn't necessary here, only format *diversity* is, which is a much
+smaller and uncomplicated thing to synthesize from scratch. A `cli_safe`
+flag keeps the CLI/URL-embedded injection variant free of characters
+(spaces, `@`, quotes) that would break the regex captures `scanning.py` uses
+to find that specific shape.
+
 Running the multi-defect variant through the whole pipeline, end to end:
 
 ```bash
@@ -306,7 +340,90 @@ start), `checkpoint-*/`, `lora_adapter/`, `metrics.{jsonl,csv,png}`, and,
 once you run the commands above against it, `eval/` and
 `scenarios_results.xlsx`. `runs/` is gitignored (multi-GB checkpoints) —
 keep whatever you want in the TCC write-up (e.g. `run_info.json`,
-`metrics.png`, `eval_summary.json`) copied out separately.
+`metrics.png`, `eval_summary.json`) copied out separately. Note
+`--strategy` here only labels the run folder name; it doesn't control which
+dataset gets loaded (`--data-dir` does) — the CLI prints a warning if the
+two look inconsistent (e.g. `--strategy multi-defect` with a `--data-dir`
+that doesn't mention it), since this has silently produced a mislabeled run
+before.
+
+---
+
+## Real-world testing
+
+`dataset/output*/test.jsonl` measures in-distribution recall against the
+same synthetic mutation pipeline that generated training data — useful, but
+it can't catch a model that's overfit to that pipeline's own surface
+patterns. `scenarios/` is a separate, hand-written set of 10 real-world
+Kubernetes manifests (`1-orion.yaml` … `10-mongodb.yaml`, sourced from public
+examples) used specifically to catch that.
+
+**`scenarios/test_cases.yaml`** is the ground truth: 40 individual error
+instances across the 10 files (not one row per file), each categorized as
+exactly one of `Credenciais Expostas` / `Imagem sem Tag` / `Erro de
+Sintaxe/Config`, with a line number and description. Every instance also
+records what this project's own rule taxonomy can say about it — a `rule_id`
+(or `null` if none of the 6 active rules cover it) plus enough to identify
+that *specific* instance among possibly several findings of the same rule in
+one file. Every `Erro de Sintaxe/Config` instance is `rule_id: null` today:
+all four selector-mismatch instances are cross-document (a `Service`'s
+`spec.selector` checked against a *different* document's `Deployment`
+labels), which `detect_ksec006` never attempts (see Known limitations); the
+rest (typos, an invalid `volumeID`, a nonexistent binary) have no
+corresponding rule at all. That's reported as an honest scope boundary, not
+a failing test.
+
+**`finetune/run_scenarios.py`** runs a checkpoint against every scenario file
+several times (sampled, `temperature>0`, so repeated runs can actually
+differ) and scores it against `test_cases.yaml`, producing an Excel report
+with `Detecção` and `Corrigido` sheets (`Arquivo | Erros | Detectado/Corrigido
+| Não detectado/corrigido | % OK`, averaged across the sampled runs) plus a
+`Categorias` breakdown and the raw ground truth for reference. "Corrected"
+is checked automatically the same way `evaluate.py` does: reuse
+`dataset/detect.py`'s detectors against the model's own patch — if no
+finding matching that instance survives, it's fixed.
+
+**`finetune/zero_shot_baseline.py`** sends the exact same `SYSTEM_PROMPT` to
+a *non-fine-tuned* base model via Ollama and scores the response with the
+same logic `evaluate.py` uses, to answer "does the bigger base model already
+do this without any training?" A real comparison run (Qwen2.5-Coder-14B,
+zero-shot, against `sql.yaml`) found it correctly identified both real
+issues with sound reasoning, but produced malformed JSON (an invalid escape
+inside a generated YAML string) — a genuine base-model-vs-fine-tuned
+tradeoff worth stating explicitly: better raw semantic understanding, but
+unreliable structured output, which is exactly what fine-tuning on a fixed
+schema is supposed to fix.
+
+```bash
+finetune/.venv/bin/python -m finetune.run_scenarios --adapter runs/<name>/lora_adapter
+finetune/.venv/bin/python -m finetune.zero_shot_baseline --model qwen2.5-coder:14b --manifest scenarios/3-mysql.yaml
+```
+
+---
+
+## Benchmarking training throughput
+
+`finetune/benchmark_throughput.py` finds the `--batch-size`/`--grad-accum`
+sweet spot for a given model/GPU by running short bursts of real training
+steps (no eval, no checkpointing — neither is representative of pure
+throughput) across whatever combos you give it, on the actual training data
+so sequence-length padding matches a real run. Reports samples/sec,
+steps/sec, tokens/sec (computed from `include_num_input_tokens_seen`, since
+the installed `transformers` version tracks the token count but doesn't
+itself divide it into a final rate), and peak VRAM per combo — a combo that
+hits CUDA OOM is recorded and skipped rather than crashing the sweep.
+
+```bash
+finetune/.venv/bin/python -m finetune.benchmark_throughput \
+    --model unsloth/Qwen2.5-Coder-3B-Instruct-bnb-4bit \
+    --data-dir dataset/output-multi-defect/unsloth \
+    --combos 1x32 2x16 4x8 8x4 16x2 \
+    --steps 20
+```
+
+Results are written as JSON, auto-named the same way `runs/` folders are
+(`finetune/output/throughput/<timestamp>_<model-slug>.json`) unless
+`--output` is given explicitly.
 
 ---
 
@@ -630,6 +747,36 @@ be valid after a later mutation touches a sibling field).
   feed KSEC-004, which is disabled — `pipeline.sh` no longer runs it by
   default for exactly this reason; it's still available to run manually if
   KSEC-004 gets re-enabled.
+- **The pipeline has never trained on a genuinely multi-document example.**
+  `dataset/build.py::load_records()` splits every multi-document corpus file
+  into separate, independent single-document records before anything else
+  runs — every training example ever produced has exactly one document, with
+  `"doc": 0` always, even though `SYSTEM_PROMPT` advertises multi-document
+  support. Found via two real `scenarios/` failures: a model's patch for a
+  `Service`'s selector used Deployment-style `matchLabels` syntax (a flat
+  `spec.selector` map doesn't have that field) since it's never seen a bare
+  Service as the subject of a finding, and a separate run mislabeled which
+  document a finding belonged to entirely. Fixing this means teaching
+  `build.py` to occasionally compose several independently-mutated documents
+  back into one genuinely multi-document example with correct `doc` indices
+  — a real, scoped feature addition, not yet implemented.
+- **`scanning.py`'s high-entropy fallback has a false-positive blind spot for
+  legitimate uppercase-hyphenated identifiers** — e.g. `SCRAM-SHA-256` (a
+  real, public MongoDB auth mechanism name) trips the entropy heuristic and
+  gets treated as a leaked secret, because `KEBAB_IDENTIFIER_RE`'s exclusion
+  is lowercase-only. Found via `scenarios/1-orion.yaml`: a model's patch
+  correctly externalized both real credentials, but the automated "is it
+  fixed" check kept failing because this unrelated value never stopped
+  looking like a secret. This costs real training data too — any corpus
+  document containing a similar identifier in a legitimate non-secret field
+  gets wrongly dropped as "dirty" during corpus filtering. Not yet fixed.
+- **`scenarios/test_cases.yaml`'s "Erro de Sintaxe/Config" category (9 of its
+  40 instances) is entirely outside the current 6-rule taxonomy** — typos,
+  an invalid `volumeID`, a nonexistent command binary, and all 4
+  cross-document selector mismatches. `finetune/run_scenarios.py` reports
+  this honestly (expected ~0% detected today) rather than silently excluding
+  it, so the report shows the taxonomy's actual scope, not an inflated
+  score.
 
 ---
 
@@ -661,6 +808,27 @@ be valid after a later mutation touches a sibling field).
 │   ├── report.py                 # diversity diagnostics
 │   ├── test_*.py                 # unit tests
 │   └── output/                   # generated: {mode}.jsonl, {mode}.curated.jsonl, report-*/
+├── finetune/                     # fine-tuning: export, train, evaluate, infer -- own venv (Python 3.11)
+│   ├── export_for_unsloth.py     # renders the real chat template, drops oversized examples
+│   ├── train_unsloth.py          # Unsloth QLoRA training, hardware presets, auto-named runs/ folders
+│   ├── run_naming.py             # runs/<timestamp>_<strategy>_<model-slug>/ naming convention
+│   ├── metrics_logger.py         # TrainerCallback -> metrics.jsonl
+│   ├── plot_metrics.py           # metrics.jsonl -> metrics.{csv,png} (runs from main .venv)
+│   ├── import_trainer_state.py   # recovers metrics from a checkpoint's trainer_state.json
+│   ├── evaluate.py               # scores a checkpoint against dataset/output*/test.jsonl
+│   ├── infer.py                  # single-prompt interactive testing CLI
+│   ├── run_scenarios.py          # scores a checkpoint against scenarios/test_cases.yaml
+│   ├── zero_shot_baseline.py     # same scoring, against a non-fine-tuned base model via Ollama
+│   ├── benchmark_throughput.py   # batch-size/grad-accum throughput sweep
+│   ├── setup_vm.sh               # one-command training VM bootstrap
+│   ├── requirements.txt          # separate, heavier stack (torch/unsloth/trl/...)
+│   ├── test_*.py                 # unit tests (pure-logic ones run from main .venv)
+│   └── output/                   # legacy fixed output dir; runs/ is now the default
+├── scenarios/                    # 10 hand-written real-world manifests, for out-of-distribution testing
+│   ├── test_cases.yaml           # per-instance ground truth (40 rows) -- see "Real-world testing"
+│   └── *.yaml                    # 1-orion.yaml ... 10-mongodb.yaml
+├── runs/                         # auto-generated training run history (gitignored)
+├── scripts/                      # compress/decompress_dataset.sh, VM setup helpers
 ├── pipeline.sh                   # chains generation → curation → report → dataset.build
 ├── requirements.txt
 └── README.md                     # this file

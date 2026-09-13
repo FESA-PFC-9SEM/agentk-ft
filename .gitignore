@@ -30,6 +30,12 @@ query_training/runs/
 # HuggingFace snapshot bookkeeping that `hf download` recreates on demand.
 query_training/corpus/**/.cache/
 
+# incident-diagnosis task (monitoring_training/): teacher-generated dataset,
+# splits, and evaluation output. Regenerate with monitoring_training.generate_dataset
+# (~$0.05 of gpt-4o-mini) + split_dataset. Model runs land in runs/ (already ignored).
+monitoring_training/output/
+monitoring_training/.venv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
