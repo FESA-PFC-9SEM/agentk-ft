@@ -9,10 +9,8 @@ cd "$SCRIPT_DIR"
 
 shopt -s nullglob
 files=(
-    dataset/output/*.jsonl.gz
-    dataset/output/unsloth/*.jsonl.gz
-    dataset/output-multi-defect/*.jsonl.gz
-    dataset/output-multi-defect/unsloth/*.jsonl.gz
+    dataset/output*/*.jsonl.gz
+    dataset/output*/unsloth/*.jsonl.gz
     generation/output/*.jsonl.gz
 )
 

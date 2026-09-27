@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Compresses large dataset/generation .jsonl files (both the single-defect
-# and multi-defect strategy outputs -- see README.md's "Dataset generation
-# strategies" section) so they fit under GitHub's 100MiB file limit
+# Compresses large dataset/generation .jsonl files (every dataset/output*
+# folder: the single-defect and multi-defect strategy outputs -- see
+# README.md's "Dataset generation strategies" section -- plus any versioned
+# rebuild such as dataset/output-multi-defect-v2) so they fit under GitHub's 100MiB file limit
 # (dataset/output/unsloth/train.jsonl alone is ~130MB uncompressed -- GitHub
 # rejects it outright). Run this before committing. The raw .jsonl files are
 # gitignored; only the .jsonl.gz files get committed. Run
@@ -14,10 +15,8 @@ cd "$SCRIPT_DIR"
 
 shopt -s nullglob
 files=(
-    dataset/output/*.jsonl
-    dataset/output/unsloth/*.jsonl
-    dataset/output-multi-defect/*.jsonl
-    dataset/output-multi-defect/unsloth/*.jsonl
+    dataset/output*/*.jsonl
+    dataset/output*/unsloth/*.jsonl
     generation/output/*.jsonl
 )
 
