@@ -11,7 +11,7 @@ Ground truth is hand-maintained, not derived from a detector -- these files
 are hand-written scenario manifests, not dataset/build.py output, so there's
 no canonical hardened form to diff against. Each instance additionally
 records what this project's own rule taxonomy can say about it: a `rule_id`
-(or null if none of the 6 active rules cover it -- an honest scope boundary,
+(or null if none of this project's rules cover it -- an honest scope boundary,
 not a bug) plus enough to identify that SPECIFIC instance among possibly
 several findings of the same rule in one file (see test_cases.yaml's header
 comment for the matching strategy). "Corrected" is checked automatically by
@@ -32,26 +32,15 @@ from __future__ import annotations
 
 import argparse
 import collections
-import copy
 from pathlib import Path
 
-import jsonpatch
 import yaml
 
-from dataset.detect import detect_ksec001, detect_ksec005
+from dataset.detect import detect_file
 from dataset.schema import SYSTEM_PROMPT
-from finetune.evaluate import parse_model_output
+from finetune.evaluate import apply_multidoc_patch, parse_model_output
 
 CATEGORIES = ("Credenciais Expostas", "Imagem sem Tag", "Erro de Sintaxe/Config")
-
-# One read-only detector per rule_id a test_cases.yaml instance can name.
-# Extend this alongside test_cases.yaml if a future instance targets a rule
-# beyond these two (e.g. KSEC-002/006/007/008).
-_DETECTORS = {
-    "KSEC-001": detect_ksec001,
-    "KSEC-005": detect_ksec005,
-}
-
 
 def load_test_cases(path: Path) -> dict[str, list[dict]]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -62,27 +51,6 @@ def load_scenario_files(scenarios_dir: Path) -> list[Path]:
         (p for p in scenarios_dir.glob("*.yaml") if p.name not in ("ground_truth.yaml", "test_cases.yaml")),
         key=lambda p: p.name,
     )
-
-
-def apply_multidoc_patch(docs: list[dict], patch: list[dict]) -> tuple[list[dict] | None, bool]:
-    """Same idea as finetune/evaluate.py's _apply_patch_safe, but doc-aware:
-    scenario files are multi-document, so patch ops (each carrying a "doc"
-    index per dataset/schema.py) must be grouped and applied per-document."""
-    docs = copy.deepcopy(docs)
-    if not patch:
-        return docs, True
-    by_doc: dict[int, list[dict]] = {}
-    for op in patch:
-        doc_idx = op.get("doc", 0)
-        by_doc.setdefault(doc_idx, []).append({k: v for k, v in op.items() if k != "doc"})
-    try:
-        for doc_idx, ops in by_doc.items():
-            if not isinstance(doc_idx, int) or doc_idx < 0 or doc_idx >= len(docs):
-                return None, False
-            docs[doc_idx] = jsonpatch.apply_patch(docs[doc_idx], ops)
-        return docs, True
-    except Exception:
-        return None, False
 
 
 def _finding_matches_instance(finding: dict, instance: dict) -> bool:
@@ -104,8 +72,7 @@ def _finding_matches_instance(finding: dict, instance: dict) -> bool:
 def score_instance(instance: dict, findings: list[dict], patched_findings: list[dict] | None) -> dict:
     """Scores one ground-truth instance against one generation's findings
     (before the patch) and, if the patch applied, the findings remaining
-    after it. rule_id: null instances (outside this project's 6 active
-    rules) are always "not applicable" -- reported as never detected/
+    after it. rule_id: null instances (outside this project's rules) are always "not applicable" -- reported as never detected/
     corrected, honestly reflecting the taxonomy's current scope rather than
     silently excluding them."""
     if instance["rule_id"] is None:
@@ -139,12 +106,7 @@ def score_run(docs: list[dict], instances: list[dict], raw_output: str) -> dict:
     result["patch_applies"] = applied_ok
     patched_findings = None
     if applied_ok:
-        patched_findings = [
-            finding.to_dict()
-            for i, d in enumerate(patched_docs)
-            for detector in _DETECTORS.values()
-            for finding in detector(d, i)
-        ]
+        patched_findings = [finding.to_dict() for finding in detect_file(patched_docs)]
 
     for instance in instances:
         result["instances"][instance["id"]] = score_instance(instance, findings, patched_findings)

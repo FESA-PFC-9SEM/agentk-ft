@@ -19,6 +19,7 @@ import argparse
 import collections
 import hashlib
 import json
+import posixpath
 import random
 import re
 import sys
@@ -29,9 +30,10 @@ import jsonpatch
 import pandas as pd
 import yaml
 
-from dataset.dedup import dedup
-from dataset.detect import detect_structural
-from dataset.multi_mutate import mutate_multi_defect
+from dataset.dedup import dedup, skeleton_hash
+from dataset.detect import detect_file, detect_semantic, detect_structural
+from dataset.k8s import POD_TEMPLATE_KINDS, get_pod_labels, get_service_selector, label_selector_matches
+from dataset.multi_mutate import mutate_multi_defect, mutate_multi_defect_file, mutate_single_defect_file
 from dataset.mutate import FAKE_SECRET_VAR_NAMES, MUTATORS
 from dataset.normalize import normalize_document
 from dataset.scanning import find_secrets
@@ -59,6 +61,15 @@ class Record:
     doc: dict
     repo: str
     path: str
+
+
+@dataclass
+class Bundle:
+    """A multi-document file assembled from sibling files of one repository
+    directory (see find_sibling_bundles)."""
+
+    docs: list[dict]
+    repo: str
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +160,26 @@ def assert_round_trip(mutated_doc: dict, patch, canonical: dict, context: str) -
         raise RuntimeError(f"round-trip failure in {context}: patch does not reproduce the canonical form")
 
 
-def doc_to_yaml(doc: dict) -> str:
+def assert_round_trip_file(mutated_docs: list[dict], patch, canonical_docs: list[dict], context: str) -> None:
+    """assert_round_trip for a multi-document file: each op applies to the
+    document its `doc` index names."""
+    reconstructed = list(mutated_docs)
+    for i in range(len(mutated_docs)):
+        ops = [{k: v for k, v in p.to_dict().items() if k != "doc"} for p in patch if p.doc == i]
+        if ops:
+            reconstructed[i] = jsonpatch.apply_patch(mutated_docs[i], ops)
+    if reconstructed != canonical_docs or any(p.doc >= len(mutated_docs) for p in patch):
+        raise RuntimeError(f"round-trip failure in {context}: patch does not reproduce the canonical form")
+
+
+def doc_to_yaml(doc: dict | list) -> str:
+    """One document as YAML, or a list of them as a multi-document file."""
+    if isinstance(doc, list):
+        return "---\n".join(doc_to_yaml(d) for d in doc)
     return yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
 
 
-def make_example(doc_for_input: dict, response: Response, repo: str, rule_id: str) -> dict:
+def make_example(doc_for_input: dict | list, response: Response, repo: str, rule_id: str) -> dict:
     errors = validate_response(response.to_dict())
     if errors:
         raise RuntimeError(f"response fails schema validation ({rule_id}, repo={repo}): {errors}")
@@ -164,6 +190,156 @@ def make_example(doc_for_input: dict, response: Response, repo: str, rule_id: st
             {"role": "assistant", "content": json.dumps(response.to_dict(), ensure_ascii=False)},
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-document files ("sibling bundles")
+# ---------------------------------------------------------------------------
+
+# Probability of adding one unrelated sibling (ConfigMap, HPA, Ingress, ...)
+# to a bundle, so the documents carrying defects aren't always at index 0/1.
+_EXTRA_SIBLING_PROBABILITY = 0.3
+
+
+def find_sibling_bundles(records: list[Record], rng: random.Random) -> list[Bundle]:
+    """Multi-document files assembled from the corpus, which stores one
+    document per row (real multi-document files are split upstream). A
+    workload and the Service selecting it usually live in sibling files of
+    one repository directory (deployment.yaml + service.yaml), so each
+    Service there that selects exactly ONE workload becomes a
+    [workload, Service] file, in random order, sometimes with one extra
+    sibling that neither creates pods nor is a Service (so it can't make the
+    pairing ambiguous). Must run on records BEFORE structural dedup: dedup
+    strips labels and selectors, so it collapses almost every Service into a
+    handful of skeletons."""
+    groups: dict[tuple[str, str], list[Record]] = collections.defaultdict(list)
+    for r in records:
+        if not r.repo.startswith("synthetic:"):
+            groups[(r.repo, posixpath.dirname(r.path))].append(r)
+
+    bundles = []
+    for (repo, _), members in groups.items():
+        workloads = [(r.doc, labels) for r in members if (labels := get_pod_labels(r.doc)[0]) is not None]
+        if not workloads:
+            continue
+        extras = [r.doc for r in members if r.doc.get("kind") not in POD_TEMPLATE_KINDS and r.doc.get("kind") != "Service"]
+        for r in members:
+            selector = get_service_selector(r.doc)
+            if selector is None:
+                continue
+            selected = [doc for doc, labels in workloads if label_selector_matches(selector, labels)]
+            if len(selected) != 1:
+                continue
+            docs = [selected[0], r.doc]
+            rng.shuffle(docs)
+            if extras and rng.random() < _EXTRA_SIBLING_PROBABILITY:
+                docs.insert(rng.randrange(len(docs) + 1), rng.choice(extras))
+            bundles.append(Bundle(docs=docs, repo=repo))
+    return bundles
+
+
+def canonicalize_bundle(bundle: Bundle) -> Bundle | None:
+    """The same per-document gauntlet build() runs (no plaintext secret,
+    normalizable, no pre-existing semantic finding) for every member, plus
+    no finding at FILE level -- e.g. a cross-document selector mismatch.
+    None if any member or the file as a whole fails."""
+    canonical_docs = []
+    for doc in bundle.docs:
+        if find_secrets(doc):
+            return None
+        canonical = normalize_document(doc)
+        if canonical is None:
+            return None
+        if detect_structural(canonical):
+            raise RuntimeError(f"bug in normalize.py: doc from {bundle.repo} is still dirty after normalization")
+        canonical_docs.append(canonical)
+    if any(f.rule_id in RULE_IDS for f in detect_file(canonical_docs)):
+        return None
+    return Bundle(docs=canonical_docs, repo=bundle.repo)
+
+
+def usable_bundles(candidates: list[Bundle]) -> list[Bundle]:
+    """Canonical bundles, deduplicated on their members' structural
+    skeletons (the same notion of "duplicate" as for single documents)."""
+    seen = set()
+    out = []
+    for candidate in candidates:
+        bundle = canonicalize_bundle(candidate)
+        if bundle is None:
+            continue
+        key = tuple(skeleton_hash(d) for d in bundle.docs)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(bundle)
+    return out
+
+
+def bundle_examples(
+    bundles: list[Bundle],
+    strategy: str,
+    positive_target: int,
+    negative_target: int,
+    rng: random.Random,
+    ksec001_candidate_names,
+    min_defects: int,
+    max_defects: int,
+) -> tuple[list[tuple[str, dict]], int, int]:
+    """(examples, positives emitted, negatives emitted) from multi-document
+    bundles. Positives follow the strategy (one defect, balanced across
+    rules; or 2+ simultaneous defects anywhere in the file); negatives are
+    the canonical bundles themselves."""
+    examples: list[tuple[str, dict]] = []
+    positives = 0
+    if strategy == "single-defect":
+        per_rule_cap = 2 * max(1, positive_target // len(RULE_IDS))
+        pools: dict[str, list] = {rid: [] for rid in RULE_IDS}
+        for rid in RULE_IDS:
+            order = list(bundles)
+            rng.shuffle(order)
+            for b in order:
+                if len(pools[rid]) >= per_rule_cap:
+                    break
+                try:
+                    result = mutate_single_defect_file(b.docs, rng, rid, ksec001_candidate_names)
+                except AssertionError:
+                    continue
+                if result is not None:
+                    pools[rid].append((b, result))
+        quotas = _resolve_quotas(positive_target, pools)
+        for rid in RULE_IDS:
+            for b, result in pools[rid][: quotas[rid]]:
+                assert_round_trip_file(result.mutated_docs, result.patch, result.canonical_docs, f"{rid}/file/{b.repo}")
+                response = Response(findings=result.findings, patch=result.patch, new_resources=result.new_resources)
+                examples.append((b.repo, make_example(result.mutated_docs, response, b.repo, rid)))
+                positives += 1
+    else:
+        order = list(bundles)
+        rng.shuffle(order)
+        for b in order:
+            if positives >= positive_target:
+                break
+            try:
+                result = mutate_multi_defect_file(
+                    b.docs, rng, min_defects, max_defects, ksec001_candidate_names=ksec001_candidate_names
+                )
+            except AssertionError:
+                continue
+            if result is None:
+                continue
+            assert_round_trip_file(result.mutated_docs, result.patch, result.canonical_docs, f"multi/file/{b.repo}")
+            response = Response(findings=result.findings, patch=result.patch, new_resources=result.new_resources)
+            label = "multi-file:" + "+".join(sorted(result.applied_rule_ids))
+            examples.append((b.repo, make_example(result.mutated_docs, response, b.repo, label)))
+            positives += 1
+
+    negatives = 0
+    order = list(bundles)
+    rng.shuffle(order)
+    for b in order[:negative_target]:
+        examples.append((b.repo, make_example(b.docs, Response(), b.repo, "negative")))
+        negatives += 1
+    return examples, positives, negatives
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +382,7 @@ def build(args: argparse.Namespace) -> dict:
     docs_read = len(records)
     print(f"Valid documents read (corpus + synthetic): {docs_read}", file=sys.stderr)
 
+    all_records = records  # pre-dedup: sibling bundles need the Services dedup collapses
     kept_idx, survival_rate = dedup([r.doc for r in records])
     records = [records[i] for i in kept_idx]
     unique_after_dedup = len(records)
@@ -227,6 +404,7 @@ def build(args: argparse.Namespace) -> dict:
 
     canonical_records: list[Record] = []
     dropped_unfixable = 0
+    dropped_preexisting_semantic = 0
     for r in clean_records:
         canonical = normalize_document(r.doc)
         if canonical is None:
@@ -234,6 +412,14 @@ def build(args: argparse.Namespace) -> dict:
             continue
         if detect_structural(canonical):
             raise RuntimeError(f"bug in normalize.py: doc from {r.repo} is still dirty after normalization")
+        # normalize.py only guarantees rules 001-005; a real document can
+        # already violate a semantic rule (006+). Kept, it would either become
+        # a "clean" negative with a real unlabeled defect, or a single-defect
+        # example whose label misses its second defect -- both teach the model
+        # to ignore that defect.
+        if any(f.rule_id in RULE_IDS for f in detect_semantic(canonical)):
+            dropped_preexisting_semantic += 1
+            continue
         canonical_records.append(Record(doc=canonical, repo=r.repo, path=r.path))
 
     # Union of the curated base pool with names actually seen in real corpus
@@ -251,6 +437,7 @@ def build(args: argparse.Namespace) -> dict:
         "dedup_survival_rate": round(survival_rate, 4),
         "dropped_as_dirty_secret": dirty_count,
         "dropped_as_unfixable_rbac": dropped_unfixable,
+        "dropped_preexisting_semantic_finding": dropped_preexisting_semantic,
         "usable_canonical_docs": len(canonical_records),
         "kind_distribution": dict(kind_distribution.most_common()),
         "harvested_credential_key_names": len(harvested_key_names),
@@ -265,9 +452,41 @@ def build(args: argparse.Namespace) -> dict:
     strategy = getattr(args, "strategy", "single-defect")
     min_defects = getattr(args, "min_defects", 2)
     max_defects = getattr(args, "max_defects", 4)
+    multi_doc_ratio = getattr(args, "multi_doc_ratio", 0.0)
+
+    negative_target = round(args.total * args.negative_ratio)
+    positive_target = args.total - negative_target
+
+    # Multi-document examples first, with their own rng so that
+    # --multi-doc-ratio 0 reproduces the single-document dataset exactly.
+    examples = []
+    docs_per_example: collections.Counter = collections.Counter()
+    bundle_positives = bundle_negatives = 0
+    if multi_doc_ratio > 0:
+        bundle_rng = random.Random(args.seed + 1)
+        candidates = find_sibling_bundles(all_records, bundle_rng)
+        bundles = usable_bundles(candidates)
+        diagnostic["bundle_candidates"] = len(candidates)
+        diagnostic["usable_bundles"] = len(bundles)
+        print(f"Multi-document bundles: {len(bundles)} usable of {len(candidates)} candidates", file=sys.stderr)
+        if bundles:
+            bundle_out, bundle_positives, bundle_negatives = bundle_examples(
+                bundles,
+                strategy,
+                round(positive_target * multi_doc_ratio),
+                min(round(negative_target * multi_doc_ratio), len(bundles)),
+                bundle_rng,
+                ksec001_candidate_names,
+                min_defects,
+                max_defects,
+            )
+            examples.extend(bundle_out)
+            for _, example in bundle_out:
+                docs_per_example[example["messages"][1]["content"].count("\n---\n") + 1] += 1
+    doc_positive_target = positive_target - bundle_positives
+    doc_negative_target = negative_target - bundle_negatives
 
     mutation_precondition_failures = 0
-    examples = []
 
     if strategy == "single-defect":
         # Pool of applicable mutations per rule: tries to mutate every
@@ -297,7 +516,8 @@ def build(args: argparse.Namespace) -> dict:
                 if result is not None:
                     pools[rid].append((r, result))
 
-        quotas = _resolve_quotas(args, pools)
+        quotas = _resolve_quotas(doc_positive_target, pools)
+        quotas["negative"] = doc_negative_target
 
         for rid in RULE_IDS:
             pool = pools[rid]
@@ -319,15 +539,14 @@ def build(args: argparse.Namespace) -> dict:
         # generation strategies" for why this exists (a model trained only
         # on single-defect examples missed a second finding when a
         # real-world manifest actually had two).
-        negative_target = round(args.total * args.negative_ratio)
-        positive_target = args.total - negative_target
-        quotas = {"positive": positive_target, "negative": negative_target}
+        quotas = {"positive": doc_positive_target, "negative": doc_negative_target}
 
         order = list(canonical_records)
         rng.shuffle(order)
         defect_count_distribution: collections.Counter = collections.Counter()
+        doc_positives = 0
         for r in order:
-            if len(examples) >= positive_target:
+            if doc_positives >= doc_positive_target:
                 break
             try:
                 result = mutate_multi_defect(
@@ -352,6 +571,7 @@ def build(args: argparse.Namespace) -> dict:
             rule_label = "multi:" + "+".join(sorted(result.applied_rule_ids))
             example = make_example(result.mutated_doc, response, r.repo, rule_label)
             examples.append((r.repo, example))
+            doc_positives += 1
             defect_count_distribution[len(result.applied_rule_ids)] += 1
 
     negative_quota = quotas["negative"]
@@ -379,6 +599,9 @@ def build(args: argparse.Namespace) -> dict:
     diagnostic["mutation_precondition_failures"] = mutation_precondition_failures
     diagnostic["examples_emitted"] = {k: len(v) for k, v in splits.items()}
     diagnostic["examples_emitted"]["total"] = sum(len(v) for v in splits.values())
+    docs_per_example[1] = diagnostic["examples_emitted"]["total"] - sum(docs_per_example.values())
+    diagnostic["multi_doc_examples"] = {"positive": bundle_positives, "negative": bundle_negatives}
+    diagnostic["docs_per_example"] = dict(sorted(docs_per_example.items()))
     if strategy == "multi-defect":
         diagnostic["defect_count_distribution"] = dict(sorted(defect_count_distribution.items()))
 
@@ -399,13 +622,10 @@ def build(args: argparse.Namespace) -> dict:
     return diagnostic
 
 
-def _resolve_quotas(args: argparse.Namespace, pools: dict[str, list]) -> dict[str, int]:
-    """Decides how many examples per rule + negatives, respecting --total
-    and --negative-ratio, but never exceeding how much each rule actually
-    managed to mutate (available pool)."""
-    total = args.total
-    negative_target = round(total * args.negative_ratio)
-    positive_target = total - negative_target
+def _resolve_quotas(positive_target: int, pools: dict[str, list]) -> dict[str, int]:
+    """Decides how many positive examples per rule, splitting positive_target
+    evenly but never exceeding how much each rule actually managed to mutate
+    (available pool)."""
     per_rule_target = positive_target // len(RULE_IDS)
 
     quotas = {}
@@ -426,7 +646,6 @@ def _resolve_quotas(args: argparse.Namespace, pools: dict[str, list]) -> dict[st
             if leftover <= 0:
                 break
 
-    quotas["negative"] = negative_target
     return quotas
 
 
@@ -453,6 +672,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="cap on parquet rows read (smoke test)")
     parser.add_argument("--total", type=int, default=2000, help="total number of examples to generate")
     parser.add_argument("--negative-ratio", type=float, default=0.35)
+    parser.add_argument(
+        "--multi-doc-ratio",
+        type=float,
+        default=0.3,
+        help="share of positives and negatives built as multi-document files from sibling files "
+        "(a workload + the Service selecting it); 0 = single-document examples only",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)

@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 from pathlib import Path
@@ -56,26 +57,42 @@ def parse_model_output(raw_text: str) -> tuple[dict | None, list[str]]:
     return (obj if not errors else None), errors
 
 
-def _patch_ops(patch: list[dict]) -> list[dict]:
-    """Strips the 'doc' field dataset/schema.py's PatchOp carries -- these
-    examples are always single-document, so jsonpatch.apply_patch operates
-    directly on the doc dict, exactly like dataset/build.py's
-    assert_round_trip does."""
-    return [{k: v for k, v in op.items() if k != "doc"} for op in patch]
+def parse_manifest(text: str) -> list:
+    """Every YAML document in a (possibly multi-document) manifest, in
+    order -- the indices findings' and patch ops' "doc" fields refer to."""
+    return list(yaml.safe_load_all(text))
 
 
-def _apply_patch_safe(doc: dict, patch: list[dict]) -> tuple[dict | None, bool]:
+def apply_multidoc_patch(docs: list, patch: list[dict]) -> tuple[list | None, bool]:
+    """Applies patch ops to a (possibly multi-document) manifest: each op
+    carries a "doc" index per dataset/schema.py, so ops are grouped and
+    applied per document, exactly like dataset/build.py's round-trip checks.
+    Returns (patched docs, True), or (None, False) if any op fails -- the
+    patch is model-generated, so a bad path or doc index is an expected
+    outcome for a wrong prediction, not a bug."""
+    docs = copy.deepcopy(docs)
     if not patch:
-        return doc, True
+        return docs, True
+    by_doc: dict[int, list[dict]] = {}
+    for op in patch:
+        doc_idx = op.get("doc", 0)
+        by_doc.setdefault(doc_idx, []).append({k: v for k, v in op.items() if k != "doc"})
     try:
-        return jsonpatch.apply_patch(doc, _patch_ops(patch)), True
+        for doc_idx, ops in by_doc.items():
+            if not isinstance(doc_idx, int) or doc_idx < 0 or doc_idx >= len(docs):
+                return None, False
+            docs[doc_idx] = jsonpatch.apply_patch(docs[doc_idx], ops)
+        return docs, True
     except Exception:
         return None, False
 
 
-def evaluate_example(input_doc: dict, expected_response: dict, model_output_text: str) -> dict:
+def evaluate_example(input_docs: dict | list, expected_response: dict, model_output_text: str) -> dict:
     """Pure scoring for one example -- no model/network involved. Compares
-    the model's parsed response against this example's ground truth."""
+    the model's parsed response against this example's ground truth.
+    `input_docs` is the manifest's document list (parse_manifest), or a
+    single document dict."""
+    docs = input_docs if isinstance(input_docs, list) else [input_docs]
     model_response, schema_errors = parse_model_output(model_output_text)
     expected_rules = {f["rule_id"] for f in expected_response.get("findings", [])}
 
@@ -94,8 +111,8 @@ def evaluate_example(input_doc: dict, expected_response: dict, model_output_text
     predicted_rules = {f["rule_id"] for f in model_response.get("findings", [])}
     result["predicted_rules"] = sorted(predicted_rules)
 
-    expected_result, _ = _apply_patch_safe(input_doc, expected_response.get("patch", []))
-    model_result, applied_ok = _apply_patch_safe(input_doc, model_response.get("patch", []))
+    expected_result, _ = apply_multidoc_patch(docs, expected_response.get("patch", []))
+    model_result, applied_ok = apply_multidoc_patch(docs, model_response.get("patch", []))
     result["patch_applies"] = applied_ok
     if applied_ok:
         result["patch_correct"] = model_result == expected_result
@@ -226,10 +243,10 @@ def run(args: argparse.Namespace) -> dict:
         messages = example["messages"]
         system, user, assistant = (messages[0]["content"], messages[1]["content"], messages[2]["content"])
         expected_response = json.loads(assistant)
-        input_doc = yaml.safe_load(user)
+        input_docs = parse_manifest(user)
 
         output_text = generate_response_text(model, tokenizer, system, user, args.max_new_tokens)
-        result = evaluate_example(input_doc, expected_response, output_text)
+        result = evaluate_example(input_docs, expected_response, output_text)
         results.append(result)
         details.append({"index": i, "raw_output": output_text, **result})
 

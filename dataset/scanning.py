@@ -29,7 +29,7 @@ from dataclasses import dataclass
 SENSITIVE_KEY_RE = re.compile(
     r"(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
     r"private[_-]?key|client[_-]?secret|auth|credential|conn(ection)?[_-]?str|"
-    r"dsn|passphrase)",
+    r"dsn|passphrase|license[_-]?key)",
     re.IGNORECASE,
 )
 
@@ -83,6 +83,16 @@ _HASH_LENGTHS = frozenset({32, 40, 64})
 # (already handled by HEX_RE) -- an all-lowercase hyphenated string is an
 # identifier, not a random secret, even with relatively high entropy.
 KEBAB_IDENTIFIER_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# The all-caps hyphenated form of the same thing: algorithm/protocol names
+# (SCRAM-SHA-256, TLS-AES-256-GCM). Needs at least one hyphen, and mixed case
+# is still entropy-checked -- a random secret mixes cases.
+UPPER_KEBAB_IDENTIFIER_RE = re.compile(r"^[A-Z0-9]+(-[A-Z0-9]+)+$")
+# A single `name=value` assignment (a sysctl like vm.max_map_count=262144, a
+# JVM -D property without the dash, an env-style KEY=VALUE arg): judged as
+# the value under that name, so DB_PASSWORD=hunter2 is still caught and a
+# numeric sysctl isn't mistaken for a random secret. The value can't start
+# with "=", so base64 padding ("c2VjcmV0==") never splits as an assignment.
+ASSIGNMENT_RE = re.compile(r"^(?P<lhs>[A-Za-z_][\w.-]*)=(?P<rhs>[^=\s]\S*)$")
 # Command-line flags ("--timeout=60s") and regex/JSON-embedded values
 # (brackets, braces, backslash) are never secrets.
 CODE_LIKE_RE = re.compile(r"[\\^$\[\]{}|<>]")
@@ -104,6 +114,19 @@ CLI_FLAG_CRED_RE = re.compile(
 )
 # Basic-auth credential embedded in a URL, e.g. "curl https://admin:hunter2@host/...".
 BASIC_AUTH_URL_RE = re.compile(r"(?P<val>[a-zA-Z0-9._%+-]+:[^\s@/]+)@[a-zA-Z0-9.-]+")
+# A credential flag whose value is the NEXT list element, e.g.
+# args: ["-dbuser", "admin", "-dbpwd", "123456789"]. Anchored on the sensitive
+# word at the end, so "--password-file /run/secret" stays clean.
+SPLIT_CLI_FLAG_RE = re.compile(
+    r"^--?[a-z0-9_.-]*(?P<word>password|passwd|pwd|token|secret|api[-_]?key|apikey|access[-_]?key|client[-_]?secret)$",
+    re.IGNORECASE,
+)
+# "--secret"/"--*-token" flags very often take a resource NAME rather than
+# the credential itself (--secret webhook-certs, --hub-kubeconfig-secret
+# hub-kube-config, etcd's --initial-cluster-token skydns-etcd -- all seen on
+# the real corpus), so after those a Kubernetes-style hyphenated name isn't
+# flagged. After a password/API-key flag the value is always the credential.
+_NAME_TAKING_FLAG_WORDS = frozenset({"token", "secret"})
 # Bearer token embedded in a command, e.g. "-H 'Authorization: Bearer eyJhbGc...'".
 BEARER_TOKEN_RE = re.compile(r"Bearer\s+(?P<val>[A-Za-z0-9._~+/=-]{8,})", re.IGNORECASE)
 
@@ -172,6 +195,10 @@ def _looks_like_secret_value(key: str, value: str) -> str | None:
             return f"value under sensitive key '{key_str}'"
         return None
 
+    assignment = ASSIGNMENT_RE.match(value)
+    if assignment:
+        return _looks_like_secret_value(assignment["lhs"], assignment["rhs"])
+
     if MIN_LEN_FOR_ENTROPY <= len(value) <= MAX_LEN_FOR_ENTROPY and not any(
         (
             " " in value,
@@ -183,6 +210,7 @@ def _looks_like_secret_value(key: str, value: str) -> str | None:
             URL_RE.match(value),
             DOMAIN_LIKE_RE.match(value),
             KEBAB_IDENTIFIER_RE.match(value),
+            UPPER_KEBAB_IDENTIFIER_RE.match(value),
             CODE_LIKE_RE.search(value),
             HEX_RE.match(value) and len(value) in _HASH_LENGTHS,
         )
@@ -249,6 +277,16 @@ def _find_cli_embedded_secret(value: str) -> tuple[str, str] | None:
     return None
 
 
+def _is_split_flag_value(flag_word: str, value) -> bool:
+    if not isinstance(value, str) or value.startswith("-") or is_placeholder(value):
+        return False
+    if any(c.isspace() for c in value):  # prose/placeholder ("YOUR SECRET HERE"), not one CLI token
+        return False
+    if flag_word.lower() in _NAME_TAKING_FLAG_WORDS and "-" in value and KEBAB_IDENTIFIER_RE.match(value):
+        return False
+    return True
+
+
 def find_cli_embedded_secrets(doc) -> list[SecretHit]:
     """Dedicated scan of `command` and `args` list values (anywhere in the
     document) for credentials embedded in longer command strings. Complements
@@ -268,6 +306,16 @@ def find_cli_embedded_secrets(doc) -> list[SecretHit]:
                         if found:
                             reason, candidate = found
                             hits.append(SecretHit(path=f"{path}/{k}/{i}", key=k, value=candidate, reason=reason))
+                        flag = SPLIT_CLI_FLAG_RE.match(item)
+                        if flag and i + 1 < len(v) and _is_split_flag_value(flag["word"], v[i + 1]):
+                            hits.append(
+                                SecretHit(
+                                    path=f"{path}/{k}/{i + 1}",
+                                    key=item.lstrip("-"),
+                                    value=v[i + 1],
+                                    reason="credential passed as a separate CLI flag value",
+                                )
+                            )
                 else:
                     _walk(v, f"{path}/{k}")
         elif isinstance(node, list):
@@ -281,10 +329,17 @@ def find_cli_embedded_secrets(doc) -> list[SecretHit]:
 def find_secrets(doc) -> list[SecretHit]:
     """Scans a Kubernetes document and returns the plaintext secrets found.
     `doc` is the already-loaded dict (yaml.safe_load of a single document)."""
+    cli_hits = find_cli_embedded_secrets(doc)
+    # A split flag's value is also a leaf of its own (args: ["-dbpwd", "Xk9q2"])
+    # that the generic heuristics may flag too: one credential, one hit -- the
+    # CLI reason, which says why it's a credential.
+    cli_paths = {hit.path for hit in cli_hits}
     hits: list[SecretHit] = []
     for path, key, value in walk_leaves(doc):
+        if path in cli_paths:
+            continue
         reason = _looks_like_secret_value(key, value)
         if reason:
             hits.append(SecretHit(path=path, key=key, value=value, reason=reason))
-    hits.extend(find_cli_embedded_secrets(doc))
+    hits.extend(cli_hits)
     return hits

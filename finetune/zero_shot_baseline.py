@@ -19,10 +19,9 @@ import argparse
 import json
 
 import httpx
-import yaml
 
 from dataset.schema import SYSTEM_PROMPT
-from finetune.evaluate import evaluate_example, parse_model_output
+from finetune.evaluate import evaluate_example, parse_manifest, parse_model_output
 
 OLLAMA_URL = "http://localhost:11434"
 
@@ -83,8 +82,7 @@ def run(args: argparse.Namespace) -> None:
     print(json.dumps(response, indent=2, ensure_ascii=False))
 
     if ground_truth is not None:
-        input_doc = yaml.safe_load(manifest_text)
-        result = evaluate_example(input_doc, ground_truth, output_text)
+        result = evaluate_example(parse_manifest(manifest_text), ground_truth, output_text)
         print("\n" + "=" * 80)
         print("GROUND TRUTH")
         print("=" * 80)

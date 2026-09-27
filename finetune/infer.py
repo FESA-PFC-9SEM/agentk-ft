@@ -25,10 +25,8 @@ import json
 import sys
 from pathlib import Path
 
-import yaml
-
 from dataset.schema import SYSTEM_PROMPT
-from finetune.evaluate import evaluate_example, generate_response_text, load_model, parse_model_output
+from finetune.evaluate import evaluate_example, generate_response_text, load_model, parse_manifest, parse_model_output
 
 
 def load_manifest_and_ground_truth(args: argparse.Namespace) -> tuple[str, dict | None]:
@@ -80,8 +78,7 @@ def run(args: argparse.Namespace) -> dict:
 
     result = None
     if ground_truth is not None:
-        input_doc = yaml.safe_load(manifest_text)
-        result = evaluate_example(input_doc, ground_truth, output_text)
+        result = evaluate_example(parse_manifest(manifest_text), ground_truth, output_text)
 
         print()
         print("=" * 80)

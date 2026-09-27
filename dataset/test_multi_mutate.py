@@ -1,9 +1,11 @@
+import copy
 import random
 
 import jsonpatch
 import pytest
 
-from dataset.multi_mutate import mutate_multi_defect
+from dataset.detect import detect_file
+from dataset.multi_mutate import mutate_multi_defect, mutate_multi_defect_file, mutate_single_defect_file
 from dataset.schema import RULE_IDS
 
 
@@ -219,3 +221,117 @@ def test_multiple_runs_produce_varied_rule_combinations():
             combos.add(tuple(sorted(result.applied_rule_ids)))
 
     assert len(combos) > 1
+
+
+def _db_deployment():
+    """Eligible for KSEC-010 and KSEC-011 as well as the generic rules, so
+    compositions exercise the new rules alongside the old ones."""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "db"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "db"}},
+            "template": {
+                "metadata": {"labels": {"app": "db"}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "db",
+                            "image": "postgres:15",
+                            "ports": [{"containerPort": 5432}],
+                            "readinessProbe": {"tcpSocket": {"port": 5432}},
+                            "env": [
+                                {
+                                    "name": "POSTGRES_PASSWORD",
+                                    "valueFrom": {"secretKeyRef": {"name": "pg", "key": "password"}},
+                                }
+                            ],
+                            "resources": {
+                                "requests": {"cpu": "100m", "memory": "64Mi"},
+                                "limits": {"cpu": "200m", "memory": "128Mi"},
+                            },
+                        }
+                    ]
+                },
+            },
+        },
+    }
+
+
+def test_new_rules_compose_with_the_others():
+    applied = set()
+    successes = 0
+    for seed in range(200):
+        result = mutate_multi_defect(_db_deployment(), random.Random(seed), min_defects=2, max_defects=6)
+        if result is None:
+            continue
+        successes += 1
+        applied |= set(result.applied_rule_ids)
+        assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+        assert sorted(f.rule_id for f in result.findings) == sorted(result.applied_rule_ids)
+    assert successes > 150
+    assert {"KSEC-010", "KSEC-011"} <= applied
+
+
+def _service_for(workload):
+    labels = workload["spec"]["template"]["metadata"]["labels"]
+    return {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "s"}, "spec": {"selector": dict(labels), "ports": [{"port": 80}]}}
+
+
+def _files():
+    config_map = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg"}, "data": {"a": "b"}}
+    rich, db = _rich_deployment(), _db_deployment()
+    db_pod_spec = db["spec"]["template"]["spec"]
+    db_pod_spec["containers"][0]["volumeMounts"] = [{"name": "data", "mountPath": "/var/lib/postgresql/data"}]
+    db_pod_spec["volumes"] = [{"name": "data", "emptyDir": {}}]
+    return {
+        "workload+service": [rich, _service_for(rich)],
+        "service+db+configmap": [_service_for(db), db, config_map],
+    }
+
+
+def _apply_file_patch(docs, patch):
+    docs = copy.deepcopy(docs)
+    for i in range(len(docs)):
+        ops = [{k: v for k, v in op.to_dict().items() if k != "doc"} for op in patch if op.doc == i]
+        if ops:
+            docs[i] = jsonpatch.apply_patch(docs[i], ops)
+    return docs
+
+
+@pytest.mark.parametrize("name", ["workload+service", "service+db+configmap"])
+@pytest.mark.parametrize("seed", range(40))
+def test_multi_defect_file_round_trips_and_counts_every_finding(name, seed):
+    docs = _files()[name]
+    result = mutate_multi_defect_file(copy.deepcopy(docs), random.Random(seed), min_defects=2, max_defects=5)
+    if result is None:
+        return
+    assert _apply_file_patch(result.mutated_docs, result.patch) == result.canonical_docs
+    assert len([f for f in detect_file(result.mutated_docs) if f.rule_id in RULE_IDS]) == len(result.findings)
+    assert [f for f in detect_file(result.canonical_docs) if f.rule_id in RULE_IDS] == []
+
+
+def test_multi_defect_file_reaches_documents_beyond_index_zero_and_the_service_rule():
+    seen_docs, service_findings = set(), 0
+    for seed in range(60):
+        result = mutate_multi_defect_file(_files()["service+db+configmap"], random.Random(seed))
+        if result is None:
+            continue
+        seen_docs |= {f.doc for f in result.findings}
+        service_findings += sum(f.doc == 0 and f.rule_id == "KSEC-006" for f in result.findings)
+    assert 1 in seen_docs and service_findings
+
+
+@pytest.mark.parametrize("rule_id", sorted(RULE_IDS - {"KSEC-004"}))
+def test_single_defect_file_injects_exactly_that_rule(rule_id):
+    produced = 0
+    for seed in range(15):
+        for docs in _files().values():
+            result = mutate_single_defect_file(copy.deepcopy(docs), random.Random(seed), rule_id)
+            if result is None:
+                continue
+            produced += 1
+            assert {f.rule_id for f in result.findings} == {rule_id}
+            assert _apply_file_patch(result.mutated_docs, result.patch) == result.canonical_docs
+    assert produced

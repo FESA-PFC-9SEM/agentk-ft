@@ -14,14 +14,15 @@ re-deriving the combined finding set from the final document state.
 
 from __future__ import annotations
 
+import collections
 import copy
 import random
 from dataclasses import dataclass, field
 
 import jsonpatch
 
-from dataset.detect import detect_all
-from dataset.mutate import MUTATORS
+from dataset.detect import detect_all, detect_file
+from dataset.mutate import MUTATORS, FileMutationResult, mutate_ksec006_service
 from dataset.schema import Finding, PatchOp, RULE_IDS
 
 # How many times the SAME rule can fire in one example -- e.g. two separate
@@ -124,6 +125,146 @@ def mutate_multi_defect(
     return MultiMutationResult(
         mutated_doc=current_doc,
         canonical=running_canonical,
+        findings=findings,
+        patch=patch,
+        new_resources=new_resources,
+        applied_rule_ids=applied_rule_ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-document files
+# ---------------------------------------------------------------------------
+
+# The cross-document KSEC-006 mutation (a Service's selector no longer matching
+# its workload), as a step alongside the per-document MUTATORS.
+SERVICE_SELECTOR_STEP = "KSEC-006/service"
+
+
+@dataclass
+class MultiFileMutationResult:
+    mutated_docs: list[dict]
+    canonical_docs: list[dict]
+    findings: list[Finding]
+    patch: list[PatchOp]
+    new_resources: list[str] = field(default_factory=list)
+    applied_rule_ids: list[str] = field(default_factory=list)
+
+
+def _step_rule_id(step: str) -> str:
+    return "KSEC-006" if step == SERVICE_SELECTOR_STEP else step
+
+
+def _file_rule_counts(docs: list[dict]) -> collections.Counter:
+    return collections.Counter(f.rule_id for f in detect_file(docs) if f.rule_id in RULE_IDS)
+
+
+def _apply_file_step(docs: list[dict], rng: random.Random, step: str, ksec001_candidate_names=None):
+    """One mutation somewhere in a file: the Service-selector mutation, or a
+    per-document mutator on the first member (in random order) it applies
+    to, with that member's index as doc_index. Returns a FileMutationResult
+    only if it changed nothing but its own rule's finding count at FILE
+    level -- MUTATORS' own guard can't see cross-document findings."""
+    if step == SERVICE_SELECTOR_STEP:
+        result = mutate_ksec006_service(docs, rng)
+    else:
+        result = None
+        order = list(range(len(docs)))
+        rng.shuffle(order)
+        mutator = MUTATORS[step]
+        for i in order:
+            try:
+                if step == "KSEC-001":
+                    doc_result = mutator(docs[i], rng, i, candidate_names=ksec001_candidate_names)
+                else:
+                    doc_result = mutator(docs[i], rng, i)
+            except AssertionError:
+                continue
+            if doc_result is None:
+                continue
+            mutated, canonical = list(docs), list(docs)
+            mutated[i], canonical[i] = doc_result.mutated_doc, doc_result.canonical
+            result = FileMutationResult(mutated, canonical, doc_result.findings, doc_result.patch, doc_result.new_resources)
+            break
+    if result is None:
+        return None
+    added = _file_rule_counts(result.mutated_docs) - _file_rule_counts(result.canonical_docs)
+    expected = collections.Counter({_step_rule_id(step): len(result.findings)})
+    if added != expected or (_file_rule_counts(result.canonical_docs) - _file_rule_counts(result.mutated_docs)):
+        return None
+    return result
+
+
+def mutate_single_defect_file(
+    docs: list[dict], rng: random.Random, rule_id: str, ksec001_candidate_names=None
+) -> FileMutationResult | None:
+    """One defect of `rule_id` injected somewhere in a multi-document file.
+    KSEC-006 is either its single-document form (a workload's own selector)
+    or the cross-document one (a Service's), chosen at random."""
+    if _file_rule_counts(docs):
+        return None
+    steps = [rule_id]
+    if rule_id == "KSEC-006":
+        steps.append(SERVICE_SELECTOR_STEP)
+        rng.shuffle(steps)
+    for step in steps:
+        result = _apply_file_step(docs, rng, step, ksec001_candidate_names)
+        if result is not None:
+            return result
+    return None
+
+
+def mutate_multi_defect_file(
+    docs: list[dict],
+    rng: random.Random,
+    min_defects: int = 2,
+    max_defects: int = 4,
+    ksec001_candidate_names=None,
+) -> MultiFileMutationResult | None:
+    """mutate_multi_defect for a whole multi-document file: each step is a
+    per-document mutator on some member, or the cross-document Service
+    mutation. Same chaining of inverse patches and fixed-forward canonical
+    deltas, kept per document."""
+    if _file_rule_counts(docs):
+        return None
+
+    steps = (list(MUTATORS) + [SERVICE_SELECTOR_STEP]) * MAX_REPEATS_PER_RULE
+    target_count = rng.randint(min_defects, min(max_defects, len(steps)))
+    rng.shuffle(steps)
+
+    current = list(docs)
+    running_canonical = copy.deepcopy(docs)
+    applied_rule_ids: list[str] = []
+    patch: list[PatchOp] = []
+    new_resources: list[str] = []
+    expected_findings = 0
+
+    for step in steps:
+        if len(applied_rule_ids) >= target_count:
+            break
+        result = _apply_file_step(current, rng, step, ksec001_candidate_names)
+        if result is None:
+            continue
+        patch = result.patch + patch
+        new_resources += result.new_resources
+        for i, (before, target) in enumerate(zip(current, result.canonical_docs)):
+            delta = jsonpatch.make_patch(before, target).patch
+            if delta:
+                running_canonical[i] = jsonpatch.apply_patch(running_canonical[i], delta)
+        current = result.mutated_docs
+        applied_rule_ids.append(_step_rule_id(step))
+        expected_findings += len(result.findings)
+
+    if len(applied_rule_ids) < 2:
+        return None
+
+    findings = [f for f in detect_file(current) if f.rule_id in RULE_IDS]
+    assert len(findings) == expected_findings, (
+        f"expected {expected_findings} findings after injecting {applied_rule_ids}, got {len(findings)}"
+    )
+    return MultiFileMutationResult(
+        mutated_docs=current,
+        canonical_docs=running_canonical,
         findings=findings,
         patch=patch,
         new_resources=new_resources,

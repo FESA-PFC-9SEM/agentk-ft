@@ -204,3 +204,36 @@ def test_aggregate_results_schema_invalid_examples_excluded_from_patch_rates():
     assert summary["schema_valid_rate"] == 0.5
     # patch_correct_rate is computed only over the schema-valid subset (1 example)
     assert summary["patch_correct_rate"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Multi-document examples
+# ---------------------------------------------------------------------------
+
+
+def test_parse_manifest_keeps_document_order():
+    from finetune.evaluate import parse_manifest
+
+    docs = parse_manifest("kind: Service\n---\nkind: Deployment\n")
+    assert [d["kind"] for d in docs] == ["Service", "Deployment"]
+
+
+def test_evaluate_example_applies_patches_per_document():
+    docs = [
+        {"kind": "Service", "spec": {"selector": {"app": "wbe"}}},
+        {"kind": "Deployment", "spec": {"template": {"metadata": {"labels": {"app": "web"}}}}},
+    ]
+    expected = {
+        "findings": [
+            {"rule_id": "KSEC-006", "severity": "high", "doc": 0, "path": "/spec/selector/app", "message": "m", "evidence": "wbe***"}
+        ],
+        "patch": [{"doc": 0, "op": "replace", "path": "/spec/selector/app", "value": "web"}],
+        "new_resources": [],
+        "notes": [],
+    }
+    result = evaluate_example(docs, expected, json.dumps(expected))
+    assert result["patch_applies"] and result["patch_correct"]
+
+    wrong_doc = dict(expected, patch=[{"doc": 1, "op": "replace", "path": "/spec/selector/app", "value": "web"}])
+    result = evaluate_example(docs, expected, json.dumps(wrong_doc))
+    assert result["patch_applies"] is False

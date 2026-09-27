@@ -15,13 +15,16 @@ is the one that generates the label.
 
 from __future__ import annotations
 
+import collections
 import copy
+import functools
 import random
 import re
 import string
 from dataclasses import dataclass, field
 
 from dataset.detect import (
+    detect_all,
     detect_ksec001,
     detect_ksec002,
     detect_ksec003,
@@ -31,28 +34,51 @@ from dataset.detect import (
     detect_ksec007,
     detect_ksec008,
     detect_ksec009,
+    detect_ksec010,
+    detect_ksec011,
+    detect_ksec006_services,
 )
 from dataset.k8s import (
+    NON_HTTP_IMAGE_PORTS,
     PROBE_FIELDS,
     RBAC_BINDING_KINDS,
     RBAC_ROLE_KINDS,
     SENSITIVE_HOST_PATHS,
+    declared_volume_names,
     get_container_ports,
     get_pod_spec,
     get_selector_match_labels,
+    get_service_selector,
     get_template_labels,
+    image_basename,
+    is_init_container_path,
     is_unpinned_image,
     iter_containers,
+    label_selector_matches,
     parse_quantity,
+    pod_label_sets,
+    required_env_for_container,
     split_image,
 )
-from dataset.schema import Finding, PatchOp, escape_json_pointer_token
+from dataset.schema import RULE_IDS, Finding, PatchOp, escape_json_pointer_token
 
 
 @dataclass
 class MutationResult:
     mutated_doc: dict
     canonical: dict
+    findings: list[Finding]
+    patch: list[PatchOp]
+    new_resources: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FileMutationResult:
+    """MutationResult for a mutation that spans a whole multi-document file:
+    one list entry per document, patch ops carrying their own doc index."""
+
+    mutated_docs: list[dict]
+    canonical_docs: list[dict]
     findings: list[Finding]
     patch: list[PatchOp]
     new_resources: list[str] = field(default_factory=list)
@@ -199,6 +225,13 @@ _CLI_INJECTION_TEMPLATES = (
     lambda fake: f"--api-key={fake}",
     lambda fake: f"--token={fake}",
     lambda fake: f"curl https://admin:{fake}@internal.example.com/report",
+    # Split form: the flag and its value as two separate list elements
+    # (e.g. orion's `-dbpwd 123456789`). Password/API-key flags only --
+    # scanning.py doesn't flag hyphenated names after --secret/--token.
+    lambda fake: ["--password", fake],
+    lambda fake: ["--db-password", fake],
+    lambda fake: ["-dbpwd", fake],
+    lambda fake: ["--api-key", fake],
 )
 
 # Probability of attempting the env-var injection first (vs. command/args).
@@ -345,7 +378,20 @@ def _mutate_ksec001_env(
 
     name_pool = candidate_names if candidate_names else FAKE_SECRET_VAR_NAMES
     existing_names = {e.get("name") for e in orig_container.get("env", []) if isinstance(e, dict)}
-    candidates = [n for n in name_pool if n not in existing_names]
+    # Composition guards against KSEC-011 (see multi_mutate.py), which removes
+    # a required env entry and restores it by index:
+    #  - never inject a var that satisfies the requirement (a plaintext
+    #    POSTGRES_PASSWORD, or a second accepted var KSEC-011 would collapse
+    #    away) -- either would erase a finding;
+    #  - never append to an env list with a pending KSEC-011 removal -- the
+    #    restoring insertion would shift this entry's index out from under
+    #    this mutator's own patch.
+    applicable = required_env_for_container(cpath, orig_container, pod_spec)
+    requirements = applicable[1] if applicable else ()
+    blocked = frozenset().union(*(r.accepted for r in requirements))
+    if any(not (existing_names & r.accepted) for r in requirements):
+        return None
+    candidates = [n for n in name_pool if n not in existing_names and n not in blocked]
     if not candidates:
         return None
     var_name = rng.choice(candidates)
@@ -382,23 +428,20 @@ def _mutate_ksec001_env(
     findings = detect_ksec001(mutated_doc, doc_index)
     assert findings, "KSEC-001 env mutation produced no finding"
 
-    namespace = canonical_doc.get("metadata", {}).get("namespace")
-    secret_yaml_lines = [
-        "apiVersion: v1",
-        "kind: Secret",
-        "metadata:",
-        f"  name: {secret_resource_name}",
-    ]
-    if namespace:
-        secret_yaml_lines.append(f"  namespace: {namespace}")
-    secret_yaml_lines += [
-        "type: Opaque",
-        "stringData:",
-        f'  {secret_key}: "<REPLACE_WITH_SECRET_VALUE>"',
-    ]
-    new_resources = ["\n".join(secret_yaml_lines)]
+    new_resources = [_placeholder_secret_yaml(canonical_doc, secret_resource_name, secret_key)]
 
     return MutationResult(mutated_doc, canonical_with_ref, findings, patch, new_resources)
+
+
+def _placeholder_secret_yaml(doc: dict, secret_name: str, key: str) -> str:
+    """The companion Secret a secretKeyRef-based fix references. The value is
+    always a placeholder: the real credential is never known here."""
+    namespace = (doc.get("metadata") or {}).get("namespace")
+    lines = ["apiVersion: v1", "kind: Secret", "metadata:", f"  name: {secret_name}"]
+    if namespace:
+        lines.append(f"  namespace: {namespace}")
+    lines += ["type: Opaque", "stringData:", f'  {key}: "<REPLACE_WITH_SECRET_VALUE>"']
+    return "\n".join(lines)
 
 
 def _mutate_ksec001_command(canonical_doc: dict, rng: random.Random, doc_index: int) -> MutationResult | None:
@@ -431,14 +474,30 @@ def _mutate_ksec001_command(canonical_doc: dict, rng: random.Random, doc_index: 
 
     fake = _fake_secret_value(rng, cli_safe=True)
     template = rng.choice(_CLI_INJECTION_TEMPLATES)
-    injected_string = template(fake)
+    injected = template(fake)
+    items = injected if isinstance(injected, list) else [injected]
 
-    patch_op = _append_list_item_with_patch(m_container, orig_container, list_key, injected_string, cpath, doc_index)
+    patch_op = _append_list_item_with_patch(m_container, orig_container, list_key, items[0], cpath, doc_index)
+    m_container[list_key].extend(items[1:])
+    # Removing the first appended index once per item undoes the whole append
+    # (each removal shifts the next item into that index); if the list itself
+    # was new, the single "remove the key" op already covers every item.
+    list_existed = isinstance(orig_container.get(list_key), list)
+    patch = [copy.deepcopy(patch_op) for _ in items] if list_existed else [patch_op]
+
+    # A client-style arg (e.g. `curl ...`) as the first arg turns a database
+    # server container into what KSEC-011 treats as a client job, silently
+    # erasing (or hiding) its finding -- an injection must never flip another
+    # rule's applicability.
+    if required_env_for_container(cpath, orig_container, pod_spec) != required_env_for_container(
+        cpath, m_container, m_pod_spec
+    ):
+        return None
 
     findings = detect_ksec001(mutated_doc, doc_index)
     assert findings, "KSEC-001 command mutation produced no finding"
 
-    return MutationResult(mutated_doc, canonical_doc, findings, [patch_op], [])
+    return MutationResult(mutated_doc, canonical_doc, findings, patch, [])
 
 
 def mutate_ksec001(
@@ -670,7 +729,7 @@ def mutate_ksec005(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
 
 
 # ---------------------------------------------------------------------------
-# KSEC-006..009 -- semantic/configuration-correctness checks
+# KSEC-006..011 -- semantic/configuration-correctness checks
 #
 # Unlike 001-005, normalize.py does NOT fix or drop documents for these
 # rules, so a real corpus document could already exhibit the bug in the
@@ -847,6 +906,61 @@ def _typo(name: str, rng: random.Random) -> str:
     return name[:i] + name[i] + name[i:]
 
 
+_SERVICE_SUFFIXES = ("-app", "-svc", "-server", "-api")
+
+
+def _mismatched_selector_value(value: str, rng: random.Random) -> str:
+    """A wrong-but-plausible Service selector value: usually a one-character
+    typo (orionld -> orionlds, selenium-hub -> sellenium-hub), otherwise a
+    dropped or extra name segment (mongodb-app -> mongodb) -- the two shapes
+    seen in the hand-written scenarios."""
+    if rng.random() < 0.6:
+        return _typo(value, rng)
+    if "-" in value:
+        return value.rsplit("-", 1)[0]
+    return value + rng.choice(_SERVICE_SUFFIXES)
+
+
+def mutate_ksec006_service(docs: list[dict], rng: random.Random) -> FileMutationResult | None:
+    """KSEC-006 across documents: breaks a Service's selector so it no longer
+    matches the one workload in the file it selected. The fix is the inverse
+    `replace` on the Service -- the workload's labels are the source of
+    truth, as the Service is what routes to them."""
+    if detect_ksec006_services(docs):
+        return None
+    workloads = pod_label_sets(docs)
+    candidates = []
+    for i, doc in enumerate(docs):
+        selector = get_service_selector(doc)
+        if selector is None:
+            continue
+        if sum(label_selector_matches(selector, labels) for _, labels in workloads) == 1:
+            candidates.append(i)
+    if not candidates:
+        return None
+
+    service_index = rng.choice(candidates)
+    selector = get_service_selector(docs[service_index])
+    key = rng.choice(sorted(selector, key=str))
+    old_value = selector[key]
+    for _ in range(5):
+        new_value = _mismatched_selector_value(str(old_value), rng)
+        broken = {**selector, key: new_value}
+        if new_value != str(old_value) and not any(label_selector_matches(broken, labels) for _, labels in workloads):
+            break
+    else:
+        return None
+
+    mutated_docs = copy.deepcopy(docs)
+    mutated_docs[service_index]["spec"]["selector"][key] = new_value
+    patch = [PatchOp(service_index, "replace", f"/spec/selector/{escape_json_pointer_token(str(key))}", old_value)]
+
+    findings = detect_ksec006_services(mutated_docs)
+    assert len(findings) == 1, "KSEC-006 Service mutation should produce exactly one finding"
+
+    return FileMutationResult(mutated_docs, copy.deepcopy(docs), findings, patch, [])
+
+
 def mutate_ksec009(canonical_doc: dict, rng: random.Random, doc_index: int = 0) -> MutationResult | None:
     if detect_ksec009(canonical_doc, doc_index):
         return None
@@ -855,8 +969,7 @@ def mutate_ksec009(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
     if pod_spec is None:
         return None
 
-    volumes = pod_spec.get("volumes")
-    volume_names = {v.get("name") for v in volumes if isinstance(v, dict)} if isinstance(volumes, list) else set()
+    volume_names = declared_volume_names(canonical_doc, pod_spec)
     if not volume_names:
         return None
 
@@ -895,16 +1008,219 @@ def mutate_ksec009(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
     return MutationResult(mutated_doc, canonical_doc, findings, [patch_op], [])
 
 
-# KSEC-003, KSEC-004 and KSEC-009 are implemented and tested above (see
-# mutate_ksec003/004/009) but deliberately left out of this registry, so
-# dataset/build.py never injects or labels examples for them -- see the note
-# next to dataset/schema.py's RULES dict. Add them back here (and to RULES)
-# to re-enable.
+_HTTP_PROBE_PATHS = ("/", "/health", "/healthz", "/ready", "/status")
+
+
+def _probe_port_is_consistent(port, port_numbers: set[int], port_names: set[str]) -> bool:
+    """True if detect_ksec007 would NOT flag this probe port -- the mirror of
+    its conditions. KSEC-010 keeps the port untouched, so starting from a
+    consistent one guarantees it never creates or hides a KSEC-007 finding."""
+    if isinstance(port, bool):
+        return False
+    if isinstance(port, int):
+        return not port_numbers or port in port_numbers
+    if isinstance(port, str):
+        return not port_names or port in port_names
+    return False
+
+
+def mutate_ksec010(canonical_doc: dict, rng: random.Random, doc_index: int = 0) -> MutationResult | None:
+    """Turns a non-HTTP server's tcpSocket/exec probe into an httpGet probe.
+    If the target container has no probe at all, the round-trip target
+    ("canonical") gains a tcpSocket probe on the server's default port -- the
+    same fixed-forward trick as KSEC-001's env variant -- so the fix taught is
+    always "use tcpSocket/exec", never "delete the probe"."""
+    if detect_ksec010(canonical_doc, doc_index):
+        return None
+
+    pod_spec, prefix = get_pod_spec(canonical_doc)
+    if pod_spec is None:
+        return None
+
+    candidates = []  # (container idx, cpath, probe field, original check field or None, port)
+    for idx, (cpath, container) in enumerate(iter_containers(pod_spec, prefix)):
+        if is_init_container_path(cpath):
+            continue
+        default_port = NON_HTTP_IMAGE_PORTS.get(image_basename(container.get("image")))
+        if default_port is None:
+            continue
+        port_numbers, port_names = get_container_ports(container)
+        default_port_ok = not port_numbers or default_port in port_numbers
+        for probe_field in PROBE_FIELDS:
+            probe = container.get(probe_field)
+            if isinstance(probe, dict):
+                tcp = probe.get("tcpSocket")
+                if isinstance(tcp, dict) and _probe_port_is_consistent(tcp.get("port"), port_numbers, port_names):
+                    candidates.append((idx, cpath, probe_field, "tcpSocket", tcp["port"]))
+                elif isinstance(probe.get("exec"), dict) and default_port_ok:
+                    candidates.append((idx, cpath, probe_field, "exec", default_port))
+            elif probe is None and probe_field != "startupProbe" and default_port_ok:
+                candidates.append((idx, cpath, probe_field, None, default_port))
+    if not candidates:
+        return None
+
+    idx, cpath, probe_field, check_field, port = rng.choice(candidates)
+    http_get = {"path": rng.choice(_HTTP_PROBE_PATHS), "port": port}
+
+    if check_field is None:
+        canonical = copy.deepcopy(canonical_doc)
+        c_pod_spec, _ = get_pod_spec(canonical)
+        _, c_container = list(iter_containers(c_pod_spec, prefix))[idx]
+        c_container[probe_field] = {"tcpSocket": {"port": port}}
+        check_field, restored_check = "tcpSocket", {"port": port}
+    else:
+        canonical = canonical_doc
+        _, orig_container = list(iter_containers(pod_spec, prefix))[idx]
+        restored_check = copy.deepcopy(orig_container[probe_field][check_field])
+
+    mutated_doc = copy.deepcopy(canonical)
+    m_pod_spec, _ = get_pod_spec(mutated_doc)
+    _, m_container = list(iter_containers(m_pod_spec, prefix))[idx]
+    del m_container[probe_field][check_field]
+    m_container[probe_field]["httpGet"] = http_get
+
+    probe_path = f"{cpath}/{probe_field}"
+    patch = [
+        PatchOp(doc_index, "remove", f"{probe_path}/httpGet"),
+        PatchOp(doc_index, "add", f"{probe_path}/{check_field}", restored_check),
+    ]
+
+    findings = detect_ksec010(mutated_doc, doc_index)
+    assert len(findings) == 1, "KSEC-010 mutation should produce exactly one finding"
+
+    return MutationResult(mutated_doc, canonical, findings, patch, [])
+
+
+def _keeps_env_entry_verbatim(entry: dict) -> bool:
+    """An entry that already satisfies the requirement without a plaintext
+    password -- a Secret/ConfigMap reference, a *_FILE path, or a random
+    root password -- is restored as-is by KSEC-011's fix."""
+    name = str(entry.get("name", ""))
+    return "valueFrom" in entry or name.endswith("_FILE") or "RANDOM" in name
+
+
+def mutate_ksec011(canonical_doc: dict, rng: random.Random, doc_index: int = 0) -> MutationResult | None:
+    """Removes an env var a database image requires (see
+    k8s.IMAGE_ENV_CONTRACTS). A secret requirement's fix restores it as a
+    secretKeyRef plus a companion placeholder Secret (the same shape as
+    KSEC-001's externalization) -- unless the original entry was already a
+    reference/*_FILE/random-password, which is restored verbatim. Plaintext
+    values or "trust"/allow-empty settings in the source doc are replaced by
+    the secretKeyRef form in the round-trip target, so the model is never
+    taught to re-add a plaintext or insecure setting. A literal requirement
+    (ACCEPT_EULA) is restored as its plain value."""
+    if detect_ksec011(canonical_doc, doc_index):
+        return None
+
+    pod_spec, prefix = get_pod_spec(canonical_doc)
+    if pod_spec is None:
+        return None
+
+    candidates = []  # (container idx, cpath, container name, requirement, satisfying env indices)
+    for idx, (cpath, container) in enumerate(iter_containers(pod_spec, prefix)):
+        applicable = required_env_for_container(cpath, container, pod_spec)
+        env = container.get("env")
+        if applicable is None or not isinstance(env, list):
+            continue
+        for requirement in applicable[1]:
+            satisfying = [i for i, e in enumerate(env) if isinstance(e, dict) and e.get("name") in requirement.accepted]
+            if satisfying:
+                candidates.append((idx, cpath, container.get("name") or "app", requirement, satisfying))
+    if not candidates:
+        return None
+
+    idx, cpath, container_name, requirement, satisfying = rng.choice(candidates)
+    _, orig_container = list(iter_containers(pod_spec, prefix))[idx]
+    orig_env = orig_container["env"]
+    primary = requirement.primary
+
+    kept = next((orig_env[i] for i in satisfying if _keeps_env_entry_verbatim(orig_env[i])), None)
+    if requirement.literal is not None:
+        restored_entry = {"name": primary, "value": requirement.literal}
+        new_resources = []
+    elif kept is not None:
+        restored_entry = copy.deepcopy(kept)
+        new_resources = []
+    else:
+        secret_name = f"{container_name}-secrets"
+        secret_key = primary.lower().replace("_", "-")
+        restored_entry = {"name": primary, "valueFrom": {"secretKeyRef": {"name": secret_name, "key": secret_key}}}
+        new_resources = [_placeholder_secret_yaml(canonical_doc, secret_name, secret_key)]
+
+    # Every satisfying entry collapses into restored_entry at the first one's
+    # position -- satisfying is sorted, so nothing before it moves.
+    insert_at = satisfying[0]
+    remaining = [e for i, e in enumerate(orig_env) if i not in satisfying]
+
+    canonical = copy.deepcopy(canonical_doc)
+    c_pod_spec, _ = get_pod_spec(canonical)
+    _, c_container = list(iter_containers(c_pod_spec, prefix))[idx]
+    c_container["env"] = copy.deepcopy(remaining[:insert_at] + [restored_entry] + remaining[insert_at:])
+
+    mutated_doc = copy.deepcopy(canonical_doc)
+    m_pod_spec, _ = get_pod_spec(mutated_doc)
+    _, m_container = list(iter_containers(m_pod_spec, prefix))[idx]
+    if remaining:
+        m_container["env"] = copy.deepcopy(remaining)
+        patch = [PatchOp(doc_index, "add", f"{cpath}/env/{insert_at}", restored_entry)]
+    else:
+        del m_container["env"]
+        patch = [PatchOp(doc_index, "add", f"{cpath}/env", [restored_entry])]
+
+    findings = detect_ksec011(mutated_doc, doc_index)
+    assert len(findings) == 1, "KSEC-011 mutation should produce exactly one finding"
+
+    return MutationResult(mutated_doc, canonical, findings, patch, new_resources)
+
+
+def _other_rule_counts(doc: dict, rule_id: str, doc_index: int) -> collections.Counter:
+    return collections.Counter(
+        f.rule_id for f in detect_all(doc, doc_index) if f.rule_id in RULE_IDS and f.rule_id != rule_id
+    )
+
+
+def _preserving_other_rules(rule_id: str, mutator):
+    """Enforces, for every registered mutator, the invariant labels depend
+    on: injecting one rule's defect must never create, erase or hide another
+    active rule's finding. A label only lists the injected rule's findings
+    (single-defect), or asserts one finding per injection (multi-defect), so
+    a side effect on another rule means a wrong label. Rules interact through
+    shared fields -- found in practice: KSEC-001 injecting a plaintext
+    POSTGRES_PASSWORD erased a KSEC-011 finding; KSEC-009 renaming a
+    replica's data mount made KSEC-011 start applying -- so this is checked
+    after every mutation instead of trusting each mutator to anticipate every
+    other rule. Compared against the mutator's own round-trip target, not its
+    input: KSEC-001/010/011 legitimately fix forward in that target."""
+
+    @functools.wraps(mutator)
+    def wrapped(canonical_doc: dict, rng: random.Random, doc_index: int = 0, **kwargs):
+        result = mutator(canonical_doc, rng, doc_index, **kwargs)
+        if result is None:
+            return None
+        if _other_rule_counts(result.mutated_doc, rule_id, doc_index) != _other_rule_counts(
+            result.canonical, rule_id, doc_index
+        ):
+            return None
+        return result
+
+    return wrapped
+
+
+# The registry dataset/build.py reads. To disable a rule from generation,
+# remove it here AND from dataset/schema.py's RULES (see the note there).
 MUTATORS = {
-    "KSEC-001": mutate_ksec001,
-    "KSEC-002": mutate_ksec002,
-    "KSEC-005": mutate_ksec005,
-    "KSEC-006": mutate_ksec006,
-    "KSEC-007": mutate_ksec007,
-    "KSEC-008": mutate_ksec008,
+    rule_id: _preserving_other_rules(rule_id, mutator)
+    for rule_id, mutator in (
+        ("KSEC-001", mutate_ksec001),
+        ("KSEC-002", mutate_ksec002),
+        ("KSEC-003", mutate_ksec003),
+        ("KSEC-004", mutate_ksec004),
+        ("KSEC-005", mutate_ksec005),
+        ("KSEC-006", mutate_ksec006),
+        ("KSEC-007", mutate_ksec007),
+        ("KSEC-008", mutate_ksec008),
+        ("KSEC-009", mutate_ksec009),
+        ("KSEC-010", mutate_ksec010),
+        ("KSEC-011", mutate_ksec011),
+    )
 }

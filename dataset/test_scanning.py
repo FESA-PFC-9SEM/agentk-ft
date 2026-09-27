@@ -237,3 +237,66 @@ def test_cli_embedded_secret_masked_correctly():
     hits = find_secrets(doc)
     assert len(hits) == 1
     assert mask_evidence(hits[0].value) == "Tr0u***"
+
+
+def _args_doc(args):
+    return {"spec": {"containers": [{"name": "app", "image": "myapp:1.0.0", "args": args}]}}
+
+
+def test_split_flag_value_is_flagged_once_at_the_value():
+    # Real scenario shape (scenarios/1-orion.yaml): flag and value are
+    # separate list elements. The random-looking value would also trip the
+    # entropy heuristic on its own -- still exactly one hit.
+    hits = find_secrets(_args_doc(["-dbhost", "mongo:27017", "-dbuser", "admin", "-dbpwd", "Xk9q2LmP7vRt"]))
+    assert len(hits) == 1
+    assert hits[0].path == "/spec/containers/0/args/5"
+    assert hits[0].value == "Xk9q2LmP7vRt"
+    assert "separate CLI flag" in hits[0].reason
+
+
+def test_split_flag_weak_numeric_password_is_flagged():
+    hits = find_cli_embedded_secrets(_args_doc(["--db-password", "123456789"]))
+    assert [h.value for h in hits] == ["123456789"]
+
+
+def test_split_flag_hard_negatives():
+    assert find_secrets(_args_doc(["--password-file", "/run/secrets/db"])) == []
+    assert find_secrets(_args_doc(["--password", "$(DB_PASSWORD)"])) == []
+    assert find_secrets(_args_doc(["--password", "--verbose"])) == []
+    assert find_secrets(_args_doc(["--secret", "YOUR SECRET HERE"])) == []
+    # --secret/--token flags often take a resource NAME (real corpus cases).
+    assert find_secrets(_args_doc(["--secret", "webhook-certs"])) == []
+    assert find_secrets(_args_doc(["--initial-cluster-token", "skydns-etcd"])) == []
+
+
+def test_split_flag_hyphenated_value_after_a_password_flag_is_still_flagged():
+    hits = find_cli_embedded_secrets(_args_doc(["--password", "my-secret-pass"]))
+    assert [h.value for h in hits] == ["my-secret-pass"]
+
+
+def test_license_key_is_a_sensitive_key():
+    doc = {"env": [{"name": "NEW_RELIC_LICENSE_KEY", "value": "abc123def456ghi789jkl"}]}
+    assert [h.key for h in find_secrets(doc)] == ["NEW_RELIC_LICENSE_KEY"]
+
+
+def test_upper_case_algorithm_names_are_not_secrets():
+    # scenarios/1-orion.yaml: `-dbAuthMech SCRAM-SHA-256` was flagged as a
+    # high-entropy secret.
+    assert find_secrets(_args_doc(["-dbAuthMech", "SCRAM-SHA-256"])) == []
+    assert find_secrets({"cipher": "TLS-AES-256-GCM-SHA384"}) == []
+
+
+def test_mixed_case_hyphenated_random_value_is_still_entropy_checked():
+    assert find_secrets({"blob": "Ab3kD9-x7Qp2Zr8W"}) != []
+
+
+def test_assignment_is_judged_as_the_value_under_its_name():
+    # scenarios/7-elasticsearch.yaml: a sysctl init container.
+    doc = {"command": ["sysctl", "-w", "vm.max_map_count=262144"]}
+    assert find_secrets(doc) == []
+    hits = find_secrets({"command": ["env", "DB_PASSWORD=hunter2hunter2"]})
+    assert [h.value for h in hits] == ["DB_PASSWORD=hunter2hunter2"]
+
+
+def test_base64_padding_is_not_mistaken_for_an_assignment():
+    assert find_secrets({"blob": "c2VjcmV0cGFzc3dvcmQxMjM0NTY3OA=="}) != []

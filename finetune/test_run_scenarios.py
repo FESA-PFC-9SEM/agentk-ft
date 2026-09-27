@@ -175,3 +175,30 @@ def test_summarize_file_averages_across_runs():
         "Erro de Sintaxe/Config": 1,
     }
     assert summary["schema_valid_rate"] == "2/2"
+
+
+def test_score_run_uses_cross_document_detection_for_service_selectors():
+    docs = [
+        {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "s"}, "spec": {"selector": {"app": "wbe"}}},
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "d"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "nginx:1.25"}]}},
+            },
+        },
+    ]
+    instance = _instance(1, "KSEC-006", doc=0, category="Erro de Sintaxe/Config")
+    output = dict(
+        CLEAN,
+        findings=[_finding("KSEC-006", doc=0, path="/spec/selector/app")],
+        patch=[{"doc": 0, "op": "replace", "path": "/spec/selector/app", "value": "web"}],
+    )
+    result = score_run(docs, [instance], json.dumps(output))
+    assert result["instances"][1] == {"detected": True, "corrected": True, "applicable": True}
+
+    unfixed = dict(output, patch=[])
+    result = score_run(docs, [instance], json.dumps(unfixed))
+    assert result["instances"][1]["corrected"] is False

@@ -7,7 +7,7 @@ defect), and as a post-normalize assertion (guarantees normalize.py actually
 produced a canonical form with no structural findings). Writing the logic
 once here avoids three divergent copies of the same rule.
 
-KSEC-006..009 are semantic/configuration-correctness checks, not security
+KSEC-006..011 are semantic/configuration-correctness checks, not security
 checks in the strict sense. Unlike 001-005, normalize.py does NOT guarantee
 the corpus is clean for them (see mutate.py for why), so they're kept out of
 detect_structural -- that function specifically backs the post-normalize
@@ -24,11 +24,18 @@ from dataset.k8s import (
     get_container_ports,
     get_pod_spec,
     get_selector_match_labels,
+    get_service_selector,
+    label_selector_matches,
+    pod_label_sets,
+    NON_HTTP_IMAGE_PORTS,
+    declared_volume_names,
     get_template_labels,
+    image_basename,
     is_sensitive_host_path,
     is_unpinned_image,
     iter_containers,
     parse_quantity,
+    required_env_for_container,
 )
 from dataset.schema import Finding, escape_json_pointer_token, mask_evidence
 
@@ -331,8 +338,7 @@ def detect_ksec009(doc, doc_index: int = 0) -> list[Finding]:
     pod_spec, prefix = get_pod_spec(doc)
     if pod_spec is None:
         return findings
-    volumes = pod_spec.get("volumes")
-    volume_names = {v.get("name") for v in volumes if isinstance(v, dict)} if isinstance(volumes, list) else set()
+    volume_names = declared_volume_names(doc, pod_spec)
     for cpath, container in iter_containers(pod_spec, prefix):
         mounts = container.get("volumeMounts")
         if not isinstance(mounts, list):
@@ -355,8 +361,81 @@ def detect_ksec009(doc, doc_index: int = 0) -> list[Finding]:
     return findings
 
 
+def detect_ksec010(doc, doc_index: int = 0) -> list[Finding]:
+    """httpGet probe on a container whose image is a non-HTTP server
+    (postgres, redis, ...). Any httpGet there is wrong regardless of port:
+    the container only runs that server, so nothing answers HTTP."""
+    findings = []
+    pod_spec, prefix = get_pod_spec(doc)
+    if pod_spec is None:
+        return findings
+    for cpath, container in iter_containers(pod_spec, prefix):
+        name = image_basename(container.get("image"))
+        if name not in NON_HTTP_IMAGE_PORTS:
+            continue
+        for probe_field in PROBE_FIELDS:
+            probe = container.get(probe_field)
+            if not isinstance(probe, dict) or not isinstance(probe.get("httpGet"), dict):
+                continue
+            # A failing liveness/startup probe restarts the container forever;
+            # a failing readiness probe "only" keeps it out of Service endpoints.
+            severity = "medium" if probe_field == "readinessProbe" else "high"
+            findings.append(
+                Finding(
+                    "KSEC-010",
+                    severity,
+                    doc_index,
+                    f"{cpath}/{probe_field}/httpGet",
+                    f"{probe_field} uses httpGet against a {name} container, which does not speak HTTP -- "
+                    "the probe can never succeed (use tcpSocket or exec)",
+                    mask_evidence(container["image"]),
+                )
+            )
+    return findings
+
+
+def detect_ksec011(doc, doc_index: int = 0) -> list[Finding]:
+    """Database server container missing an env var its entrypoint requires
+    (see k8s.IMAGE_ENV_CONTRACTS) -- the container exits at startup. One
+    finding per unmet requirement (mssql can miss both ACCEPT_EULA and the
+    SA password)."""
+    findings = []
+    pod_spec, prefix = get_pod_spec(doc)
+    if pod_spec is None:
+        return findings
+    for cpath, container in iter_containers(pod_spec, prefix):
+        applicable = required_env_for_container(cpath, container, pod_spec)
+        if applicable is None:
+            continue
+        label, requirements = applicable
+        env = container.get("env")
+        env_names = {e.get("name") for e in env if isinstance(e, dict)} if isinstance(env, list) else set()
+        for requirement in requirements:
+            if env_names & requirement.accepted:
+                continue
+            findings.append(
+                Finding(
+                    "KSEC-011",
+                    "high",
+                    doc_index,
+                    f"{cpath}/env",
+                    f"{label} image requires {requirement.primary} (or an equivalent) to be set -- "
+                    "the container will exit at startup",
+                    mask_evidence(container["image"]),
+                )
+            )
+    return findings
+
+
 _STRUCTURAL_DETECTORS = (detect_ksec002, detect_ksec003, detect_ksec004, detect_ksec005)
-_SEMANTIC_DETECTORS = (detect_ksec006, detect_ksec007, detect_ksec008, detect_ksec009)
+_SEMANTIC_DETECTORS = (
+    detect_ksec006,
+    detect_ksec007,
+    detect_ksec008,
+    detect_ksec009,
+    detect_ksec010,
+    detect_ksec011,
+)
 
 
 def detect_structural(doc, doc_index: int = 0) -> list[Finding]:
@@ -369,7 +448,7 @@ def detect_structural(doc, doc_index: int = 0) -> list[Finding]:
 
 
 def detect_semantic(doc, doc_index: int = 0) -> list[Finding]:
-    """Findings for rules 006-009 only. Kept separate from detect_structural
+    """Findings for rules 006-011 only. Kept separate from detect_structural
     since normalize.py does not guarantee the corpus is clean for these."""
     findings: list[Finding] = []
     for detector in _SEMANTIC_DETECTORS:
@@ -379,3 +458,60 @@ def detect_semantic(doc, doc_index: int = 0) -> list[Finding]:
 
 def detect_all(doc, doc_index: int = 0) -> list[Finding]:
     return detect_ksec001(doc, doc_index) + detect_structural(doc, doc_index) + detect_semantic(doc, doc_index)
+
+
+def closest_selected_workload(selector: dict, workloads: list[tuple[int, dict]]) -> tuple[int, dict] | None:
+    """Among the workloads whose pod labels carry every key of `selector`,
+    the one agreeing on the most values (first on a tie) -- the workload a
+    mismatched Service was evidently meant for. None if no workload has all
+    the keys: then the Service most likely targets a workload defined in
+    another file, which a single file can't be checked against."""
+    candidates = [(i, labels) for i, labels in workloads if all(k in labels for k in selector)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: sum(str(c[1][k]) == str(v) for k, v in selector.items()))
+
+
+def detect_ksec006_services(docs: list) -> list[Finding]:
+    """KSEC-006 across documents of one file: a Service whose spec.selector
+    matches the pod labels of NO workload in the file, while a workload with
+    the same label keys is right there -- routing is broken by a typo'd
+    value (orionlds vs orionld). One finding per selector key that differs
+    from that workload's labels."""
+    findings = []
+    workloads = pod_label_sets(docs)
+    if not workloads:
+        return findings
+    for i, doc in enumerate(docs):
+        selector = get_service_selector(doc)
+        if selector is None or any(label_selector_matches(selector, labels) for _, labels in workloads):
+            continue
+        target = closest_selected_workload(selector, workloads)
+        if target is None:
+            continue
+        _, labels = target
+        for key, value in selector.items():
+            if str(labels[key]) != str(value):
+                findings.append(
+                    Finding(
+                        "KSEC-006",
+                        "high",
+                        i,
+                        f"/spec/selector/{escape_json_pointer_token(str(key))}",
+                        f"Service selector label '{key}' matches no workload's pod labels in this file",
+                        mask_evidence(str(value)),
+                    )
+                )
+    return findings
+
+
+def detect_file(docs: list) -> list[Finding]:
+    """Every finding for a whole (possibly multi-document) file: each
+    document's own findings, tagged with its index, plus the checks that
+    need more than one document (see detect_ksec006_services)."""
+    findings: list[Finding] = []
+    for i, doc in enumerate(docs):
+        if isinstance(doc, dict):
+            findings.extend(detect_all(doc, i))
+    findings.extend(detect_ksec006_services([d if isinstance(d, dict) else {} for d in docs]))
+    return findings

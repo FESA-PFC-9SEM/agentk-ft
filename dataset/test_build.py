@@ -1,9 +1,12 @@
 import argparse
 import json
+import random
 
 import pandas as pd
+import yaml
 
-from dataset.build import _is_harvestable_key_name, build, load_synthetic_records
+from dataset.build import Record, _is_harvestable_key_name, build, doc_to_yaml, find_sibling_bundles, load_synthetic_records
+from dataset.detect import detect_file
 
 
 def test_load_synthetic_records_parses_curated_jsonl(tmp_path):
@@ -278,3 +281,187 @@ def test_build_harvests_real_key_names_and_uses_them_for_ksec001(tmp_path, monke
             if "MY_DISTINCTIVE_HARVESTED_TOKEN" in example["messages"][1]["content"]:
                 found_harvested_name = True
     assert found_harvested_name
+
+
+def test_build_drops_docs_with_a_preexisting_semantic_finding(tmp_path):
+    # normalize.py only guarantees rules 001-005 are clean. A real document
+    # already violating a semantic rule (here: postgres without
+    # POSTGRES_PASSWORD, KSEC-011) must never be emitted -- as a negative it
+    # would be labeled clean despite a real defect.
+    broken = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "db"},
+        "spec": {"containers": [{"name": "db", "image": "postgres:15"}]},
+    }
+    clean = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "web"},
+        # A different shape from `broken`, so structural dedup keeps both.
+        "spec": {"containers": [{"name": "web", "image": "myapp:1.2.3", "ports": [{"containerPort": 8080}]}]},
+    }
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    pd.DataFrame(
+        {
+            "content": [json.dumps(broken), json.dumps(clean)],
+            "max_stars_repo_name": ["repoA", "repoB"],
+            "max_stars_repo_path": ["a.yaml", "b.yaml"],
+        }
+    ).to_parquet(corpus_dir / "shard.parquet")
+
+    args = argparse.Namespace(
+        corpus_dir=str(corpus_dir),
+        synthetic_dir=None,
+        output_dir=str(tmp_path / "output"),
+        limit=None,
+        total=10,
+        negative_ratio=1.0,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        seed=1,
+    )
+    diagnostic = build(args)
+    assert diagnostic["dropped_preexisting_semantic_finding"] == 1
+    assert diagnostic["usable_canonical_docs"] == 1
+
+    emitted = [json.loads(line) for line in (tmp_path / "output" / "train.jsonl").read_text().splitlines()]
+    assert emitted
+    assert all("postgres" not in ex["messages"][1]["content"] for ex in emitted)
+
+
+def _workload(name, app):
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name},
+        "spec": {
+            "selector": {"matchLabels": {"app": app}},
+            "template": {
+                "metadata": {"labels": {"app": app}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "app",
+                            "image": f"{name}:1.2.3",
+                            "ports": [{"containerPort": 8080}],
+                            "livenessProbe": {"httpGet": {"path": "/", "port": 8080}},
+                            "resources": {
+                                "requests": {"cpu": "100m", "memory": "64Mi"},
+                                "limits": {"cpu": "200m", "memory": "128Mi"},
+                            },
+                        }
+                    ]
+                },
+            },
+        },
+    }
+
+
+def _service(app, name="svc"):
+    return {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name}, "spec": {"selector": {"app": app}, "ports": [{"port": 80}]}}
+
+
+def test_find_sibling_bundles_pairs_a_service_with_the_one_workload_it_selects():
+    records = [
+        Record(_workload("web", "web"), "repoA", "k8s/deployment.yaml"),
+        Record(_workload("db", "db"), "repoA", "k8s/db.yaml"),
+        Record(_service("web"), "repoA", "k8s/service.yaml"),
+        Record({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}, "data": {}}, "repoA", "k8s/cm.yaml"),
+        # Same repo, different directory: never paired with k8s/.
+        Record(_service("db"), "repoA", "other/service.yaml"),
+        # Selects nothing in its directory.
+        Record(_service("ghost"), "repoA", "k8s/ghost.yaml"),
+        # Synthetic records have no sibling files.
+        Record(_service("web"), "synthetic:base:0:0", "base.curated.jsonl"),
+    ]
+    for seed in range(20):
+        bundles = find_sibling_bundles(records, random.Random(seed))
+        assert len(bundles) == 1
+        kinds = [d["kind"] for d in bundles[0].docs]
+        assert sorted(k for k in kinds if k != "ConfigMap") == ["Deployment", "Service"]
+        assert bundles[0].docs[kinds.index("Deployment")]["metadata"]["name"] == "web"
+        assert bundles[0].repo == "repoA"
+
+
+def test_doc_to_yaml_joins_a_list_as_a_multi_document_file():
+    docs = [_service("web"), _workload("web", "web")]
+    text = doc_to_yaml(docs)
+    assert list(yaml.safe_load_all(text)) == docs
+    assert doc_to_yaml(docs[0]) == yaml.safe_dump(docs[0], sort_keys=False, default_flow_style=False)
+
+
+def _sibling_corpus(tmp_path, n=12):
+    rows = []
+    for i in range(n):
+        repo = f"repo{i}"
+        # Distinct shapes per repo so structural dedup keeps every bundle.
+        workload = _workload(f"app{i}", f"app{i}")
+        workload["spec"]["template"]["spec"]["containers"][0]["ports"] += [{"containerPort": 9000 + j} for j in range(i)]
+        rows.append((workload, repo, "deploy/deployment.yaml"))
+        rows.append((_service(f"app{i}"), repo, "deploy/service.yaml"))
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "content": [json.dumps(d) for d, _, _ in rows],
+            "max_stars_repo_name": [r for _, r, _ in rows],
+            "max_stars_repo_path": [p for _, _, p in rows],
+        }
+    ).to_parquet(corpus_dir / "shard.parquet")
+    return corpus_dir
+
+
+def _read_examples(output_dir):
+    return [json.loads(line) for line in (output_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def test_build_emits_multi_document_examples_that_round_trip(tmp_path):
+    for strategy in ("single-defect", "multi-defect"):
+        output_dir = tmp_path / strategy
+        args = argparse.Namespace(
+            corpus_dir=str(_sibling_corpus(tmp_path / strategy)),
+            synthetic_dir=None,
+            strategy=strategy,
+            min_defects=2,
+            max_defects=4,
+            output_dir=str(output_dir),
+            limit=None,
+            total=20,
+            negative_ratio=0.25,
+            multi_doc_ratio=0.5,
+            train_ratio=1.0,
+            val_ratio=0.0,
+            seed=3,
+        )
+        diagnostic = build(args)
+        assert diagnostic["usable_bundles"] == 12
+        assert diagnostic["multi_doc_examples"]["positive"] > 0
+        assert diagnostic["multi_doc_examples"]["negative"] > 0
+        assert diagnostic["docs_per_example"].get(2)
+
+        multi = [e for e in _read_examples(output_dir) if "\n---\n" in e["messages"][1]["content"]]
+        assert multi
+        for example in multi:
+            docs = list(yaml.safe_load_all(example["messages"][1]["content"]))
+            response = json.loads(example["messages"][2]["content"])
+            found = sorted((f.rule_id, f.doc, f.path) for f in detect_file(docs))
+            assert found == sorted((f["rule_id"], f["doc"], f["path"]) for f in response["findings"])
+
+
+def test_build_without_multi_doc_ratio_emits_single_documents_only(tmp_path):
+    args = argparse.Namespace(
+        corpus_dir=str(_sibling_corpus(tmp_path)),
+        synthetic_dir=None,
+        output_dir=str(tmp_path / "output"),
+        limit=None,
+        total=10,
+        negative_ratio=0.3,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        seed=3,
+    )
+    diagnostic = build(args)
+    assert "usable_bundles" not in diagnostic
+    assert all("\n---\n" not in e["messages"][1]["content"] for e in _read_examples(tmp_path / "output"))

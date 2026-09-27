@@ -15,24 +15,40 @@ PATCH_OPS = ("replace", "remove", "add")
 
 RULES = {
     "KSEC-001": "Plaintext credential (password, token, API key, "
-                "connection string, private key)",
+                "connection string, private key -- in env values, config, or "
+                "command/args, including a flag and its value as separate args)",
     "KSEC-002": "Insecure securityContext (privileged, runAsUser 0, "
                 "allowPrivilegeEscalation, added capabilities)",
+    "KSEC-003": "Host access (hostNetwork, hostPID or hostIPC enabled, or a "
+                "hostPath volume mounting a sensitive host path such as /etc, "
+                "/proc or /var/run/docker.sock)",
+    "KSEC-004": "Permissive RBAC (a wildcard \"*\" in a Role/ClusterRole's "
+                "apiGroups, resources or verbs, or a binding granting cluster-admin)",
     "KSEC-005": "Unpinned container image (latest tag or missing tag)",
     "KSEC-006": "Selector/label mismatch (spec.selector.matchLabels doesn't "
-                "match the pod template's own labels, breaking routing/discovery)",
+                "match the pod template's own labels, or a Service's spec.selector "
+                "matches no workload's pod labels in the same file, breaking "
+                "routing/discovery)",
     "KSEC-007": "Probe port mismatch (liveness/readiness/startup probe targets "
                 "a port not declared in the container's ports)",
     "KSEC-008": "Resource requests exceed limits (spec.containers[].resources."
                 "requests is greater than resources.limits for the same resource)",
+    "KSEC-009": "Dangling volume reference (a volumeMount names a volume the pod "
+                "doesn't declare in volumes or, for a StatefulSet, volumeClaimTemplates)",
+    "KSEC-010": "Probe protocol mismatch (an httpGet liveness/readiness/startup "
+                "probe on a server that doesn't speak HTTP, such as postgres, "
+                "mysql, redis or mongo -- use tcpSocket or exec instead)",
+    "KSEC-011": "Missing required env var for the image (a database server "
+                "container -- official postgres/mysql/mariadb/percona, bitnami "
+                "postgresql/mysql/mariadb/redis/mongodb, or Microsoft SQL Server -- "
+                "without a variable its entrypoint requires, e.g. POSTGRES_PASSWORD, "
+                "REDIS_PASSWORD or ACCEPT_EULA; add passwords from a Secret)",
 }
-# KSEC-003 (host access), KSEC-004 (permissive RBAC) and KSEC-009 (dangling
-# volume reference) are fully implemented -- detect_ksecNNN/mutate_ksecNNN
-# and their tests are still in the codebase -- but deliberately excluded
-# from RULES/MUTATORS, so the dataset pipeline never generates or labels
-# examples for them and the model is never told to detect something it was
-# never shown. Re-enabling is a code change (add back here and to
-# dataset/mutate.py's MUTATORS), not a flag.
+# Rules can be disabled from generation without deleting their tested code:
+# remove the entry here AND from dataset/mutate.py's MUTATORS. SYSTEM_PROMPT
+# is generated from this dict and build.py derives its rule set from
+# MUTATORS, so the model is never told to detect something it was never
+# shown a labeled example of. No rule is currently disabled.
 
 RULE_IDS = frozenset(RULES)
 
