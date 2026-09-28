@@ -35,6 +35,36 @@ from dataset.schema import Finding, PatchOp, RULE_IDS
 # repeat can actually succeed on a given document.
 MAX_REPEATS_PER_RULE = 2
 
+# Relative weight of each rule when choosing which defects to inject (rules
+# not listed weigh 1). With 11 rules sharing the budget uniformly, plaintext
+# credentials and unpinned images -- the two defects real manifests carry
+# most (every hand-written scenario has them) -- fell to ~50% of positives,
+# and a model trained on that missed credentials it used to catch. Weighting
+# them up restores them to roughly two thirds of positives without
+# dropping any rule.
+RULE_WEIGHTS = {"KSEC-001": 3.0, "KSEC-005": 3.0}
+
+# Defect counts favour 2-4 (the usual real-world case) with a thinner tail up
+# to max_defects, so the model also learns to keep listing findings on a
+# badly broken file (scenarios/8-newrelic.yaml has 9) instead of stopping at
+# the 4 it had only ever seen.
+_TAIL_START, _TAIL_WEIGHT = 5, 0.4
+
+
+def _sample_defect_count(rng: random.Random, min_defects: int, max_defects: int) -> int:
+    counts = list(range(min_defects, max_defects + 1))
+    return rng.choices(counts, weights=[_TAIL_WEIGHT if k >= _TAIL_START else 1.0 for k in counts])[0]
+
+
+def _weighted_order(steps: list[str], rng: random.Random, rule_weights: dict) -> list[str]:
+    """A random permutation of `steps` where heavier rules tend to come
+    first (Efraimidis-Spirakis weighted sampling without replacement) --
+    the composers apply steps in order until the target count is reached,
+    so earlier means more likely to be injected."""
+    def weight(step):
+        return rule_weights.get(_step_rule_id(step), 1.0)
+    return sorted(steps, key=lambda step: rng.random() ** (1.0 / weight(step)), reverse=True)
+
 
 @dataclass
 class MultiMutationResult:
@@ -65,9 +95,8 @@ def mutate_multi_defect(
         return None
 
     max_possible = len(MUTATORS) * MAX_REPEATS_PER_RULE
-    target_count = rng.randint(min_defects, min(max_defects, max_possible))
-    rule_pool = list(MUTATORS) * MAX_REPEATS_PER_RULE
-    rng.shuffle(rule_pool)
+    target_count = _sample_defect_count(rng, min_defects, min(max_defects, max_possible))
+    rule_pool = _weighted_order(list(MUTATORS) * MAX_REPEATS_PER_RULE, rng, RULE_WEIGHTS)
 
     current_doc = canonical_doc
     running_canonical = copy.deepcopy(canonical_doc)
@@ -114,7 +143,7 @@ def mutate_multi_defect(
         current_doc = result.mutated_doc
         applied_rule_ids.append(rule_id)
 
-    if len(applied_rule_ids) < 2:
+    if len(applied_rule_ids) < max(1, min_defects):
         return None
 
     findings = [f for f in detect_all(current_doc, doc_index) if f.rule_id in RULE_IDS]
@@ -229,8 +258,8 @@ def mutate_multi_defect_file(
         return None
 
     steps = (list(MUTATORS) + [SERVICE_SELECTOR_STEP]) * MAX_REPEATS_PER_RULE
-    target_count = rng.randint(min_defects, min(max_defects, len(steps)))
-    rng.shuffle(steps)
+    target_count = _sample_defect_count(rng, min_defects, min(max_defects, len(steps)))
+    steps = _weighted_order(steps, rng, RULE_WEIGHTS)
 
     current = list(docs)
     running_canonical = copy.deepcopy(docs)
@@ -255,7 +284,7 @@ def mutate_multi_defect_file(
         applied_rule_ids.append(_step_rule_id(step))
         expected_findings += len(result.findings)
 
-    if len(applied_rule_ids) < 2:
+    if len(applied_rule_ids) < max(1, min_defects):
         return None
 
     findings = [f for f in detect_file(current) if f.rule_id in RULE_IDS]

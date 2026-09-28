@@ -103,7 +103,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--test-file", default=None, help="pull an example from this dataset .jsonl instead")
     parser.add_argument("--index", type=int, default=0, help="which example, with --test-file")
     parser.add_argument("--max-seq-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=1280)
     return parser.parse_args(argv)
 
 

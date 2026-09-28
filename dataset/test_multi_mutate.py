@@ -335,3 +335,36 @@ def test_single_defect_file_injects_exactly_that_rule(rule_id):
             assert {f.rule_id for f in result.findings} == {rule_id}
             assert _apply_file_patch(result.mutated_docs, result.patch) == result.canonical_docs
     assert produced
+
+
+def test_min_defects_one_allows_single_defect_positives():
+    counts = set()
+    for seed in range(60):
+        result = mutate_multi_defect(_rich_deployment(), random.Random(seed), min_defects=1, max_defects=1)
+        if result is not None:
+            counts.add(len(result.applied_rule_ids))
+            assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+    assert counts == {1}
+
+
+def test_large_defect_counts_round_trip():
+    reached = 0
+    for seed in range(60):
+        result = mutate_multi_defect(_rich_deployment(), random.Random(seed), min_defects=6, max_defects=8)
+        if result is None:
+            continue
+        reached = max(reached, len(result.applied_rule_ids))
+        assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+    assert reached >= 6
+
+
+def test_rule_weights_favour_credentials_and_image_tags():
+    import collections
+
+    first_picks = collections.Counter()
+    for seed in range(400):
+        result = mutate_multi_defect(_rich_deployment(), random.Random(seed), min_defects=1, max_defects=1)
+        if result is not None:
+            first_picks[result.applied_rule_ids[0]] += 1
+    others = [n for rule, n in first_picks.items() if rule not in ("KSEC-001", "KSEC-005")]
+    assert first_picks["KSEC-001"] > max(others) and first_picks["KSEC-005"] > max(others)

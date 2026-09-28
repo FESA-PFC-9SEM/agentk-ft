@@ -289,7 +289,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-seq-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument("--max-new-tokens", type=int, default=1280)
     return parser.parse_args(argv)
 
 

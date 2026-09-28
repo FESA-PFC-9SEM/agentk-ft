@@ -667,8 +667,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="defaults to dataset/output for --strategy single-defect, "
         "dataset/output-multi-defect for --strategy multi-defect",
     )
-    parser.add_argument("--min-defects", type=int, default=2, help="multi-defect strategy only")
-    parser.add_argument("--max-defects", type=int, default=4, help="multi-defect strategy only")
+    parser.add_argument(
+        "--min-defects",
+        type=int,
+        default=1,
+        help="multi-defect strategy only: fewest defects per positive (1 lets single-defect files be positives too)",
+    )
+    parser.add_argument(
+        "--max-defects",
+        type=int,
+        default=8,
+        help="multi-defect strategy only: most defects per positive (counts above 4 are sampled less often)",
+    )
     parser.add_argument("--limit", type=int, default=None, help="cap on parquet rows read (smoke test)")
     parser.add_argument("--total", type=int, default=2000, help="total number of examples to generate")
     parser.add_argument("--negative-ratio", type=float, default=0.35)

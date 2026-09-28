@@ -92,44 +92,49 @@ A clean manifest has all four arrays empty.
 
 | Rule | Detects | Typical fix | Status |
 |---|---|---|---|
-| **KSEC-001** | Plaintext credential — password, token, API key, connection string, private key. Two injection shapes: as an env var `{name, value}` pair, or embedded in a `command`/`args` CLI flag or basic-auth URL. | Env variant: externalize to a `Secret` + `secretKeyRef`. Command variant: remove the offending arg. | **active** |
+| **KSEC-001** | Plaintext credential — password, token, API key, license key, connection string, private key. Two injection shapes: as an env var `{name, value}` pair, or in `command`/`args` — a `--password=...` flag, a basic-auth URL, or a flag and its value as separate list elements (`-dbpwd`, `123456789`). | Env variant: externalize to a `Secret` + `secretKeyRef`. Command variant: remove the offending arg(s). | **active** |
 | **KSEC-002** | Insecure `securityContext` — `privileged: true`, `runAsUser: 0`, `allowPrivilegeEscalation: true`, or added `capabilities`. | Remove/revert the offending field. | **active** |
-| **KSEC-003** | Host access — `hostNetwork`/`hostPID`/`hostIPC: true`, or a `hostPath` volume mounting a sensitive host path (`/`, `/etc`, `/var/run/docker.sock`, `/proc`, `/root`, `/var/lib/kubelet`, `/boot`, `/sys`, `/home`). | Remove the field, or remove the volume + its `volumeMount`. | *disabled* |
-| **KSEC-004** | Permissive RBAC — a wildcard `"*"` in `apiGroups`/`resources`/`verbs` on a `Role`/`ClusterRole`, or a `RoleBinding`/`ClusterRoleBinding` granting `cluster-admin`. | Revert the wildcard or the binding's `roleRef.name`. | *disabled* |
+| **KSEC-003** | Host access — `hostNetwork`/`hostPID`/`hostIPC: true`, or a `hostPath` volume mounting a sensitive host path (`/`, `/etc`, `/var/run/docker.sock`, `/proc`, `/root`, `/var/lib/kubelet`, `/boot`, `/sys`, `/home`). | Remove the field, or remove the volume + its `volumeMount`. | **active** |
+| **KSEC-004** | Permissive RBAC — a wildcard `"*"` in `apiGroups`/`resources`/`verbs` on a `Role`/`ClusterRole`, or a `RoleBinding`/`ClusterRoleBinding` granting `cluster-admin`. | Revert the wildcard or the binding's `roleRef.name`. | **active** |
 | **KSEC-005** | Unpinned container image — missing tag or `:latest` (digest-pinned images are not flagged). | Revert to the original pinned tag. | **active** |
-| **KSEC-006** | Selector/label mismatch — `spec.selector.matchLabels` doesn't match the pod template's own labels, breaking Service/Deployment routing and discovery. | Revert the selector label value. | **active** |
+| **KSEC-006** | Selector/label mismatch — a workload's `spec.selector.matchLabels` (a `ReplicationController`'s flat `spec.selector`) doesn't match its own pod template labels, **or**, across documents of one file, a `Service`'s `spec.selector` matches no workload's pod labels while a workload with the same label keys is right there. Breaks routing and discovery. | Revert the selector label value (on the Service, for the cross-document form). | **active** |
 | **KSEC-007** | Probe port mismatch — a `livenessProbe`/`readinessProbe`/`startupProbe` (`httpGet` or `tcpSocket`) targets a port not declared in the container's `ports` (checked for both numeric and named ports). | Revert the probe's port. | **active** |
 | **KSEC-008** | `resources.requests` exceeds `resources.limits` for `cpu` or `memory` — passes schema-only validation (`kubeconform`) but is rejected by the Kubernetes API at admission time. | Revert the request value. | **active** |
-| **KSEC-009** | Dangling volume reference — a `volumeMount.name` doesn't match any declared `volumes[].name`, generated via a single human-plausible character edit (transpose/delete/duplicate) of a real volume name. | Revert to the correct name. | *disabled* |
+| **KSEC-009** | Dangling volume reference — a `volumeMount.name` doesn't match any declared `volumes[].name` (or, on a `StatefulSet`, any `volumeClaimTemplates[].metadata.name`), generated via a single human-plausible character edit (transpose/delete/duplicate) of a real volume name. | Revert to the correct name. | **active** |
+| **KSEC-010** | Probe protocol mismatch — an `httpGet` liveness/readiness/startup probe on a container whose image is a non-HTTP server (`postgres`, `mysql`, `mariadb`, `redis`, `mongo`, `memcached`, incl. vendor rebuilds like `bitnami/postgresql`). The probe can never succeed: liveness/startup → restart loop (`high`), readiness → never Ready (`medium`). | Replace `httpGet` with `tcpSocket` on the same port (or restore the original `exec` check). | **active** |
+| **KSEC-011** | Missing required env var for the image — a database server container without a variable its entrypoint requires. Covers official `postgres`/`mysql`/`mariadb`/`percona` (+ `percona/percona-server`), Bitnami `postgresql`/`mysql`/`mariadb`/`redis`/`mongodb` (password or `ALLOW_EMPTY_PASSWORD`; replicas skipped), and Microsoft SQL Server (`mcr.microsoft.com/mssql/server`, `azure-sql-edge`: `ACCEPT_EULA` **and** an SA password — two independent findings). Accepted alternatives such as `*_FILE` satisfy it. The container exits at startup. | Passwords: add the variable from a `Secret` (`secretKeyRef`) + a placeholder `Secret` in `new_resources` — the same shape as KSEC-001's externalization. `ACCEPT_EULA`: add `value: "Y"`. | **active** |
 
 Severities are assigned per finding sub-case (e.g. `privileged: true` is
 `critical`, `allowPrivilegeEscalation: true` is `medium`) — see
 `dataset/detect.py` for the exact mapping.
 
 KSEC-001, KSEC-002 and KSEC-005 are "security" rules in the strict sense.
-KSEC-006 through KSEC-009 are semantic/configuration-correctness checks
+KSEC-006 through KSEC-011 are semantic/configuration-correctness checks
 added later, sharing the same rule-ID numbering and response schema by
 design decision (see [Design decisions](#design-decisions-and-rationale)).
+KSEC-010 and KSEC-011 are the first *context-dependent* rules: whether a
+field is wrong, and what the right value is, depends on which application
+the image is — see
+[Why KSEC-010/011 key on image identity](#design-decisions-and-rationale).
 
 ### Active vs. disabled rules
 
-**Only 6 rules currently generate training examples: KSEC-001, 002, 005,
-006, 007, 008.** KSEC-003, KSEC-004 and KSEC-009 are fully implemented —
-`detect_ksec003/004/009` and `mutate_ksec003/004/009` exist and are unit-
-and round-trip-tested exactly like the active rules — but deliberately
-excluded from `dataset/schema.py`'s `RULES` dict and `dataset/mutate.py`'s
-`MUTATORS` registry. Two consequences of that specific mechanism, both
-intentional:
+**All 11 rules currently generate training examples.** The rule set the
+pipeline trains on is defined by two registries: `dataset/schema.py`'s
+`RULES` dict and `dataset/mutate.py`'s `MUTATORS`. Disabling a rule from
+generation — without deleting its tested detector/mutator — means removing
+its entry from both:
 
 - `SYSTEM_PROMPT` is generated dynamically from `RULES`, so it lists only
-  the 6 active rules — the model is never told to detect something it was
+  the registered rules — the model is never told to detect something it was
   never shown a labeled example of.
 - `dataset/build.py` derives its rule set, quotas, and mutation pool from
-  `MUTATORS`, so disabling a rule here is the only change needed; no other
-  file requires editing.
+  `MUTATORS`, so no other file requires editing.
 
-Re-enabling a disabled rule means adding its entry back to both `RULES` and
-`MUTATORS` — a small, explicit code change, not a config flag.
+KSEC-003, KSEC-004 and KSEC-009 were disabled this way for a while and have
+since been re-enabled (KSEC-009 after fixing its `StatefulSet`
+`volumeClaimTemplates` false positive — see
+[Known limitations](#known-limitations)).
 
 ---
 
@@ -168,12 +173,13 @@ The critical path: turns the real corpus into `dataset.jsonl`.
 |---|---|
 | `schema.py` | System prompt, rule taxonomy, response dataclasses, validator. |
 | `scanning.py` | Real-secret detection: sensitive-key regex, Shannon entropy, connection-string/PEM patterns, placeholder allowlist, and a dedicated scan of `command`/`args` for CLI-embedded credentials. Correctly resolves the Kubernetes `{name: X, value: Y}` env-var pattern (this is the single most important correctness property in the project — see `test_env_name_value_pair`). |
-| `k8s.py` | Shared, read-only Kubernetes navigation helpers: `get_pod_spec` (resolves the PodSpec location per kind, including the 4-levels-deep CronJob case), `iter_containers`, `get_selector_match_labels`, `get_template_labels`, `get_container_ports`, `parse_quantity` (Kubernetes resource-quantity parser), image tag helpers, sensitive-hostpath check. |
-| `detect.py` | One read-only detector per rule (`detect_ksec001`..`detect_ksec009` — all 9 exist, regardless of active/disabled status), plus `detect_structural` (002-005), `detect_semantic` (006-009), and `detect_all`. Used in three places: filtering dirty corpus docs, mutator preconditions, and post-normalize assertions. |
+| `k8s.py` | Shared, read-only Kubernetes navigation helpers: `get_pod_spec` (resolves the PodSpec location per kind, including the 4-levels-deep CronJob case), `iter_containers`, `get_selector_match_labels`, `get_template_labels`, `get_pod_labels`/`get_service_selector` (for the cross-document Service check), `get_container_ports`, `parse_quantity` (Kubernetes resource-quantity parser), image tag helpers, sensitive-hostpath check. |
+| `detect.py` | One read-only detector per rule (`detect_ksec001`..`detect_ksec011`), plus `detect_structural` (002-005), `detect_semantic` (006-011), `detect_all` (one document) and `detect_file` (a whole multi-document file: every document's findings tagged with its index, plus the cross-document KSEC-006 Service check). Used for filtering dirty corpus docs, mutator preconditions, post-normalize assertions and scenario scoring. |
 | `dedup.py` | Structural deduplication — reduces a document to a "skeleton" (strips names/namespaces/labels/annotations/selectors, collapses leaf values to placeholders) and hashes it. Two manifests differing only in naming collide. |
 | `normalize.py` | Produces the canonical hardened form — the gold target. Deterministic, idempotent. Only fixes rules 002-005 forward (see rationale below); KSEC-001 docs are dropped rather than fixed. |
-| `mutate.py` | One mutator per rule (`mutate_ksec001`..`mutate_ksec009` — all 9 implemented), but `MUTATORS` — the registry `build.py` actually reads from — only lists the 6 active ones (see [Active vs. disabled rules](#active-vs-disabled-rules)). Each mutator takes a canonical doc + `random.Random` and returns a `MutationResult(mutated_doc, canonical, findings, patch, new_resources)` or `None` if not applicable. `mutate_ksec001` additionally accepts an optional `candidate_names` override (see below). |
-| `build.py` | Orchestrates the whole pipeline: load → filter → dedup → drop dirty (harvesting credential key names along the way) → normalize → mutate with per-rule quotas → 100% round-trip check → write `train/val/test.jsonl`, split by source repository. Catches a mutator's internal `AssertionError` per document/rule rather than crashing the whole run on one anomalous document (see rationale below). |
+| `mutate.py` | One mutator per rule (`mutate_ksec001`..`mutate_ksec011`). `MUTATORS` — the registry `build.py` and `multi_mutate.py` actually read from — wraps each one in a guard that rejects any mutation changing another rule's findings (see [composition](#design-decisions-and-rationale)). Each mutator takes a canonical doc + `random.Random` and returns a `MutationResult(mutated_doc, canonical, findings, patch, new_resources)` or `None` if not applicable. `mutate_ksec001` additionally accepts an optional `candidate_names` override (see below). |
+| `stats.py` | Distribution report for a built dataset: per split, positives/negatives, findings and examples per rule, severities, findings and documents per example, which rules land in multi-document files, patch ops, kinds and input sizes (`python -m dataset.stats <dir>`). |
+| `build.py` | Orchestrates the whole pipeline: load → assemble multi-document sibling bundles (before dedup) → filter → dedup → drop dirty (harvesting credential key names along the way) → normalize → mutate with per-rule quotas → 100% round-trip check → write `train/val/test.jsonl`, split by source repository. Catches a mutator's internal `AssertionError` per document/rule rather than crashing the whole run on one anomalous document (see rationale below). |
 | `view.py` | Utility to extract manifests from any `.jsonl` (dataset or generation output) into individual `.yaml` files for manual inspection — no JSON archaeology required. |
 
 ### Part B — `generation/`
@@ -181,10 +187,10 @@ The critical path: turns the real corpus into `dataset.jsonl`.
 Local LLM generates **clean input manifests only** — never labels. Exists to
 fill a gap in the real corpus: "hard negative" material (clean manifests
 that *look* suspicious). It also supports an `rbac` generation mode, built
-to address RBAC scarcity for KSEC-004 — currently unused by `pipeline.sh`
-since KSEC-004 is disabled (see
-[Active vs. disabled rules](#active-vs-disabled-rules)); run it manually if
-you re-enable that rule.
+to address RBAC scarcity for KSEC-004 — not run by `pipeline.sh`, because
+the real corpus turned out to have enough RBAC for KSEC-004 on its own
+(2,802 `ClusterRole`s, 935 `Role`s, 158 bindings; 3,895 documents KSEC-004
+can mutate). Run it manually if you want more RBAC variety.
 
 | File | Responsibility |
 |---|---|
@@ -251,13 +257,13 @@ write-up:
 
 | | **single-defect** (baseline) | **multi-defect** |
 |---|---|---|
-| Findings per positive example | exactly 1 | 2–4 (`--min-defects`/`--max-defects`) |
+| Findings per positive example | exactly 1 | 1–8, mostly 2–4 (`--min-defects`/`--max-defects`) |
 | Mutation logic | `dataset/mutate.py` (`MUTATORS`) | `dataset/multi_mutate.py`, composing the same `MUTATORS` |
 | Dataset output | `dataset/output/` (default) | `dataset/output-multi-defect/` |
 | Training run folder | `runs/<timestamp>_single-defect_<model>/` | `runs/<timestamp>_multi-defect_<model>/` |
 
 `dataset/multi_mutate.py` doesn't reimplement any rule: it starts from the
-same clean canonical document, applies 2–4 of `mutate.py`'s existing
+same clean canonical document, applies 1–8 of `mutate.py`'s existing
 per-rule mutators to it *in sequence* (each one seeing the previous step's
 already-mutated document), chains their inverse patches together, and
 re-derives the final finding set by re-running the detectors
@@ -265,6 +271,22 @@ re-derives the final finding set by re-running the detectors
 that module's docstring for why this composition is safe (each rule injects
 into a disjoint structural area, so injecting rule B never dirties rule A's
 already-injected field).
+
+**Which rules and how many (v4).** The v3 dataset drew rules uniformly and
+2–4 defects per example. Tested on `scenarios/`, the model trained on it
+regressed on plain credentials: with 11 rules sharing the budget, KSEC-001
+fell from 74% to 50% of positives (KSEC-005 from 69% to 50%), and probing the
+model showed it now called `9-storm.yaml` clean with 96% confidence despite
+a plaintext password and an unpinned image. It also stopped at ~4 findings
+on `8-newrelic.yaml`, which has 9 — it had never seen more than 4. Three
+changes, all in `dataset/multi_mutate.py`/`build.py` defaults:
+`RULE_WEIGHTS` makes KSEC-001 and KSEC-005 3× as likely to be picked (back to
+~66% of positives each, every other rule still present); defect counts run
+1–8 with counts above 4 sampled at 0.4× weight; and `--min-defects 1` lets a
+file with a single defect be a positive too, as it often is in practice.
+Answers now reach ~1,030 tokens at 8 findings, so every inference entry
+point (`evaluate`, `infer`, `run_scenarios`, the demos) defaults to
+`--max-new-tokens 1280`; the 4,096-token export drops ~1% of examples.
 
 **The same rule can fire more than once in one example** (`MAX_REPEATS_PER_RULE`,
 currently 2) — e.g. two separate plaintext credentials in one manifest, not
@@ -363,15 +385,15 @@ instances across the 10 files (not one row per file), each categorized as
 exactly one of `Credenciais Expostas` / `Imagem sem Tag` / `Erro de
 Sintaxe/Config`, with a line number and description. Every instance also
 records what this project's own rule taxonomy can say about it — a `rule_id`
-(or `null` if none of the 6 active rules cover it) plus enough to identify
-that *specific* instance among possibly several findings of the same rule in
-one file. Every `Erro de Sintaxe/Config` instance is `rule_id: null` today:
-all four selector-mismatch instances are cross-document (a `Service`'s
-`spec.selector` checked against a *different* document's `Deployment`
-labels), which `detect_ksec006` never attempts (see Known limitations); the
-rest (typos, an invalid `volumeID`, a nonexistent binary) have no
-corresponding rule at all. That's reported as an honest scope boundary, not
-a failing test.
+(or `null` if no rule covers it) plus enough to identify that *specific*
+instance among possibly several findings of the same rule in one file. 33 of
+the 40 are in scope, and the detectors catch all 33: the four Service
+selector mismatches are KSEC-006's cross-document form, `-dbpwd 123456789` is
+KSEC-001's split-flag form. The other 7 are deliberately `rule_id: null` —
+usernames (not secrets on their own), a container name that doesn't match
+its image, a nonexistent binary, mistyped paths and an invalid `volumeID`:
+none can be labeled programmatically without guessing intent. That's
+reported as an honest scope boundary, not a failing test.
 
 **`finetune/run_scenarios.py`** runs a checkpoint against every scenario file
 several times (sampled, `temperature>0`, so repeated runs can actually
@@ -379,9 +401,16 @@ differ) and scores it against `test_cases.yaml`, producing an Excel report
 with `Detecção` and `Corrigido` sheets (`Arquivo | Erros | Detectado/Corrigido
 | Não detectado/corrigido | % OK`, averaged across the sampled runs) plus a
 `Categorias` breakdown and the raw ground truth for reference. "Corrected"
-is checked automatically the same way `evaluate.py` does: reuse
-`dataset/detect.py`'s detectors against the model's own patch — if no
-finding matching that instance survives, it's fixed.
+is checked automatically by running `dataset/detect.py`'s `detect_file`
+(every rule, including cross-document checks) on the manifest after the
+model's own patch — if no finding matching that instance survives, it's
+fixed. Findings the ground truth doesn't list (e.g. KSEC-003 on
+`8-newrelic.yaml`'s host-level monitoring agent) are accepted as extras:
+they don't count against the score. Re-scored this way, the
+`20260907-1545` Qwen2.5-Coder-7B multi-defect model (trained before
+multi-document examples existed) detects 74% and corrects 53% of the
+in-scope instances across 5 sampled runs; most misses are the
+cross-document selector fixes and the files whose defects sit in document 1.
 
 **`finetune/zero_shot_baseline.py`** sends the exact same `SYSTEM_PROMPT` to
 a *non-fine-tuned* base model via Ollama and scores the response with the
@@ -478,8 +507,8 @@ python -m generation.curate --mode base
 python -m generation.curate --mode hard-negative
 python -m generation.report --input generation/output/hard-negative.curated.jsonl
 
-# --mode rbac exists but isn't run by pipeline.sh (KSEC-004 is disabled --
-# only useful if you re-enable it, see "Active vs. disabled rules")
+# --mode rbac exists but isn't run by pipeline.sh (the real corpus already
+# has enough RBAC for KSEC-004) -- optional, for more RBAC variety
 python -m generation.generate --mode rbac -n 200
 
 # merge synthetic + real corpus
@@ -532,8 +561,8 @@ export PATH="$PATH:$(go env GOPATH)/bin"   # for the two kubeconform integration
 .venv/bin/python -m pytest dataset/ generation/ -q
 ```
 
-367 tests, covering:
-- Unit tests per detector/mutator, active and disabled alike (including the
+930 tests, covering:
+- Unit tests per detector/mutator (including the
   critical `{name, value}` env-var case, and RFC 6901 escaping for
   slash-containing label keys).
 - Property-style round-trip tests (`apply_patch(mutated, patch) ==
@@ -580,11 +609,11 @@ is strictly safer than "fixing" it, since even briefly holding a real leaked
 value in memory to externalize it is exactly the kind of transient exposure
 the "never write a full secret" constraint guards against.
 
-**Why KSEC-006..009 use a soft `return None` precondition instead of a hard
+**Why KSEC-006..011 use a soft `return None` precondition instead of a hard
 `assert`.** Rules 001-005 are guaranteed clean by construction — either
 `normalize.py` actively fixes them, or the document was already dropped —
 so an `assert` firing there indicates a genuine pipeline bug worth crashing
-on. Rules 006-009 have no such guarantee: a real corpus document might
+on. Rules 006-011 have no such guarantee: a real corpus document might
 already exhibit a selector mismatch, a bad probe port, or a genuine typo "in
 the wild" (e.g. an example YAML that was never actually applied). The
 mutators for these rules check their own precondition and skip (return
@@ -636,7 +665,7 @@ unescaped, this silently corrupts the patch. `escape_json_pointer_token`
 fixes it; a real-corpus fuzz run is what surfaced the bug in the first
 place.
 
-**Why KSEC-003/004/009 are implemented but not registered.** Disabling a
+**Why disabling a rule is a two-registry change.** Disabling a
 rule from *generation* while keeping it in the codebase is deliberately a
 two-registry change (`RULES` in `schema.py`, `MUTATORS` in `mutate.py`), not
 a config flag or a code deletion. A flag would tempt silently toggling
@@ -693,44 +722,221 @@ can't take down a multi-thousand-document production run.
 ones.** Once a canonical document is confirmed fully clean
 (`detect_all(doc)` empty across every active rule — a stricter check than
 the single-defect pipeline runs per-rule, needed here because a multi-defect
-example asserts a *complete* finding set, not just one), the 6 active rules
-each touch a disjoint structural area (env vars, `securityContext`, image
-tag, selector labels, probe ports, resource quantities). That makes chaining
-them — apply mutator A to the clean doc, then mutator B to A's already-
-mutated output, etc. — safe by construction, with no interaction to design
-around: injecting B never dirties the field A just injected into. This
-reuses every rule's existing injection/detection logic unchanged; the only
-new code is the composition (chaining inverse patches in reverse
-mutation order, and re-deriving the combined finding set via `detect_all`
-on the final document rather than trusting the individually-computed
-findings, since intermediate JSON Pointer paths aren't guaranteed to still
-be valid after a later mutation touches a sibling field).
+example asserts a *complete* finding set, not just one), the active rules
+are chained — apply mutator A to the clean doc, then mutator B to A's
+already-mutated output, etc. This reuses every rule's existing
+injection/detection logic; the composition itself only chains inverse
+patches in reverse mutation order and re-derives the combined finding set
+via `detect_all` on the final document (intermediate JSON Pointer paths
+aren't guaranteed to still be valid after a later mutation touches a
+sibling field), asserting one finding per applied mutation.
+
+The first six rules touched disjoint structural areas (env vars,
+`securityContext`, image tag, selector labels, probe ports, resource
+quantities), so chaining them was safe by construction. KSEC-010 and
+KSEC-011 broke that: KSEC-010 shares probes with KSEC-007, and KSEC-011
+shares the env list with KSEC-001. The invariant every mutator now keeps
+instead is **an injection must never create, erase or hide another rule's
+finding**. It is enforced twice. First, each mutator avoids the overlaps it
+is known to have:
+
+- KSEC-010 only rewrites a probe whose port KSEC-007 considers consistent,
+  and never changes the port — so it can't create or hide a KSEC-007
+  finding in either order.
+- KSEC-001's env variant never injects a variable KSEC-011 accepts (a
+  plaintext `POSTGRES_PASSWORD` would silently satisfy — and erase — a
+  KSEC-011 finding), and never appends to an env list with a pending
+  KSEC-011 removal (KSEC-011 restores by index insertion, which would shift
+  KSEC-001's entry out from under its own `replace` patch).
+- KSEC-001's command variant refuses an injection that changes whether
+  KSEC-011 applies to the container (a `curl ...` first arg makes a
+  postgres server look like a client job, which KSEC-011 skips).
+
+Second, because the overlaps kept turning up in places nobody predicted,
+every entry in `MUTATORS` is wrapped by `_preserving_other_rules`, which
+runs `detect_all` on the mutated document and on the mutator's round-trip
+target and returns `None` (inapplicable) if any *other* rule's finding
+count differs. That catches what the per-mutator guards miss, e.g.:
+
+- KSEC-009 typoing a replica's data-volume mount breaks KSEC-011's
+  "data directory is pre-populated" exemption, so a KSEC-011 finding
+  appears out of nowhere (seen in 183 of 600 compositions on a replica
+  fixture before the wrapper).
+- KSEC-006 appending its `-xNNN` suffix to a selector value occasionally
+  yields a string random-looking enough for KSEC-001's entropy check to flag
+  as a credential — an
+  unlabeled finding in 113 of 22,420 real-corpus KSEC-006 single-defect
+  mutations. This one predates the wrapper and was silently producing
+  mislabeled examples.
+
+On the real corpus the wrapper rejects only those 113 KSEC-006 and 2
+KSEC-009 mutations; every other rule is unaffected.
+`test_multi_mutate.py::test_new_rules_compose_with_the_others` and
+`test_mutate.py::test_registered_mutators_never_change_another_rules_findings`
+exercise this, and a 3,000-composition stress run across
+postgres/mysql/mariadb/redis/replica/generic documents with all 11 rules
+enabled finds zero round-trip or finding-count failures.
+
+**Why KSEC-010/011 key on image identity.** Whether an `httpGet` probe or a
+missing env var is a bug depends on what the application *is* — the same
+field is fine on one image and fatal on another. Both rules read that
+context from the manifest itself (the image name) through small lookup
+tables in `dataset/k8s.py`, so labels stay programmatic — no cluster access,
+no other documents, no human judgment. The two lookups differ on purpose:
+`NON_HTTP_IMAGE_PORTS` matches by image basename, so vendor rebuilds
+(`bitnami/postgresql`) count too — the wire protocol doesn't change with the
+packager; `IMAGE_ENV_CONTRACTS` matches exact image identities instead
+(Docker Official Images, `bitnami/*` and `percona/percona-server` on Docker
+Hub, SQL Server on `mcr.microsoft.com`), because each packager names its
+variables differently (`bitnami/postgresql` reads `POSTGRESQL_PASSWORD` —
+and, as an alias, the official `POSTGRES_PASSWORD` its Helm chart sets).
+Mirrors and look-alikes (`localhost:32000/percona`, mcr's `oss/bitnami`
+mirror, `registry.corp/mssql`) don't match: the contract can't be confirmed
+from the name. Each contract lists one or more requirements — SQL Server has
+two, `ACCEPT_EULA` (a literal setting, fixed as `value: "Y"`) and the SA
+password — plus a replica-role variable where the packager has one: a
+Bitnami replica (`*_REPLICATION_MODE=slave`, `MONGODB_REPLICA_SET_MODE=secondary`)
+reads the primary's password from a different variable and is skipped.
+KSEC-011 also skips containers whose requirement
+can't be checked from the manifest: init containers (`pg_isready`-style
+waiters), a `command` override or client-style args (`psql`/`pg_dump`
+jobs), `envFrom` (the variable may come from a ConfigMap/Secret that isn't
+visible), `imagePullPolicy: Never` (a locally built image that merely
+shares the official name), and an init container writing to the volume
+behind the server's data directory. The official entrypoints only demand
+a password when initializing an *empty* data directory (Bitnami validates
+on every start, and SQL Server's EULA check always runs, so this exemption
+doesn't apply to those), and the replica-cloning
+pattern (xtrabackup `clone-mysql`, kubegres `setup-replica-data-directory`)
+copies an existing database in first. The last two guards came from
+hand-checking the detector's 38 hits on the real corpus: 7 were those two
+patterns (false positives); the remaining 31 are genuine, e.g. a postgres
+container configured with `PG_USER`/`PG_PASS` instead of the variable
+names the image actually reads. Extending the tables to Bitnami, Percona
+and SQL Server added 4 hits, all genuine on inspection (e.g. a `percona:5.7`
+with flags-only args and no env; an SQL Server container with neither
+variable). Run-as-root was considered as a
+context-dependent rule and rejected: whether an image can run as non-root,
+and as which UID, depends on the image's internals and volume ownership,
+which the manifest doesn't reveal — its labels would sometimes be wrong.
+
+**Why the fixes are "fixed forward".** Like KSEC-001's env variant, both new
+mutators may return a round-trip target that differs from the corpus
+document. KSEC-010 on a container with no probe at all adds a `tcpSocket`
+probe to the target, so the fix taught is always "use `tcpSocket`", never
+"delete the probe". KSEC-011 restores a `valueFrom`/`*_FILE`/random-password
+entry verbatim, but replaces a plaintext placeholder or an insecure
+`trust`/allow-empty setting with a `secretKeyRef` + placeholder `Secret`, so
+the model is never trained to re-add a plaintext or insecure setting.
+
+**Why documents with a pre-existing semantic finding are dropped.**
+`normalize.py` only guarantees rules 001-005 are clean. A real corpus
+document can already violate a semantic rule — measured on the full
+corpus: 735 of 55,747 canonical documents did (886 KSEC-007 findings, 184
+KSEC-009, 52 KSEC-006, 35 KSEC-011, 9 KSEC-008, 4 KSEC-010). Kept, such a document
+becomes either a "clean" negative with a real, unlabeled defect, or a
+single-defect example whose label misses its second defect — both teach
+the model to ignore that defect. `build.py` now drops them after
+normalization (`dropped_preexisting_semantic_finding` in
+`diagnostic.json`). The multi-defect strategy already rejected them.
+
+**Why multi-document examples come from sibling files.** The model's
+input is a whole manifest file, often several documents long (every
+scenario file is), yet the corpus stores exactly one document per parquet
+row: 268,596 rows, 268,596 documents, and only 22 repository paths occur
+twice — real multi-document files were split upstream. A model trained only
+on single documents answered `doc: 0` for everything and never learned the
+cross-document selector fix; on `10-mongodb.yaml` (defects in document 1) it
+returned no findings at all in 3 of 5 runs. The pairing that matters most is
+already in the corpus as *sibling files*: 16,526 repository directories hold
+both a workload and a Service, and 19,950 of those Services select exactly
+one workload there. `build.py::find_sibling_bundles` turns each such pair
+into a `[workload, Service]` file in random order (both orders appear in the
+scenarios), adding one unrelated sibling (ConfigMap, HPA, ...) 30% of the
+time so defects don't always sit at index 0/1. Two details matter:
+bundling runs on records *before* structural dedup, because dedup strips
+labels and selectors and collapses nearly every Service into a handful of
+skeletons; and every member goes through the same secret/normalize/
+pre-existing-finding gauntlet as a single document, plus `detect_file` on
+the whole bundle, before it's used. Bundles are then deduplicated on their
+members' skeletons. `--multi-doc-ratio` (default 0.3) sets their share of
+positives and negatives; `0` reproduces the single-document dataset exactly
+(bundles draw from their own `random.Random(seed + 1)`).
+
+**Why the cross-document KSEC-006 fix edits the Service.** The four scenario
+mismatches (`orionlds`/`orionld`, `sellenium-hub`/`selenium-hub`, ...) are
+typos in whichever side was written second, but the model can't know which.
+The Service is the side whose only job is to point at the workload's pods,
+so the fix always makes it match them; `mutate_ksec006_service` injects the
+same shapes the scenarios show (a one-character typo, or a dropped/extra
+name segment) and the inverse patch is a `replace` on the Service. The
+detector only fires when some workload in the file carries every selector
+key — otherwise the Service most likely targets a workload in another file.
+
+**Why the scanner changes for the scenarios.** Three scenario files exposed
+detector bugs that corrupted both scoring and training labels, fixed
+together: `SCRAM-SHA-256` and `vm.max_map_count=262144` were flagged as
+random secrets (all-caps hyphenated identifiers are now exempt like
+lowercase ones, and a `name=value` string is judged as the value under that
+name — `DB_PASSWORD=hunter2` is still caught); `NEW_RELIC_LICENSE_KEY` wasn't
+a sensitive key name; and `ReplicationController` wasn't a pod-template kind,
+so every container rule skipped it (1,004 corpus documents). The new
+split-flag form (`-dbpwd`, `123456789`) needed care on the other side:
+`--secret` and `--*-token` flags very often take a resource *name*
+(`--secret webhook-certs`, etcd's `--initial-cluster-token skydns-etcd`), so a
+hyphenated lowercase name after those isn't flagged, and a value containing
+spaces is treated as prose. Net effect on the deduplicated corpus: 5,793
+documents dropped as dirty instead of 6,017 (224 more usable), 39 genuine
+split-flag credentials newly caught.
 
 ---
 
 ## Known limitations
 
-- **KSEC-003, KSEC-004 and KSEC-009 currently generate no training
-  examples.** Fully implemented and tested, but excluded from `RULES`/
-  `MUTATORS` — see [Active vs. disabled rules](#active-vs-disabled-rules).
-- **KSEC-006..009 don't have a `normalize.py` hardening guarantee.** Unlike
+- **KSEC-004 never appears in multi-defect examples.** It is the only
+  rule that applies to RBAC documents, and it can only fire once per
+  document (its precondition is a clean RBAC doc), so an RBAC doc never
+  reaches the 2-defect minimum. KSEC-004 is learned from single-defect
+  examples only.
+- **KSEC-009 used to misfire on `StatefulSet`s.** A `volumeMount` naming a
+  `volumeClaimTemplates` entry is valid, but the detector only looked at
+  `volumes` — 817 of the 957 KSEC-009 hits on the real corpus were that
+  false positive. `k8s.declared_volume_names` now includes claim templates;
+  184 genuine hits remain (dropped as pre-existing findings).
+- **KSEC-006..011 don't have a `normalize.py` hardening guarantee.** Unlike
   001-005, the real corpus isn't actively fixed forward for these rules —
   documents already exhibiting the bug are simply skipped as mutation base
   material for that rule. Extending `normalize.py` to also fix these forward
-  would recover more usable corpus volume. (Only 006/007/008 matter for this
-  today, since 009 is disabled.)
-- **KSEC-006 only checks single-document selector/template consistency.**
-  A `Service`'s `spec.selector` targeting a `Deployment` in a *different*
-  document isn't checked — only workload controllers where the selector and
-  pod template live in the same resource (`Deployment`, `StatefulSet`,
-  `DaemonSet`, `ReplicaSet`).
+  would recover more usable corpus volume.
+- **KSEC-010/011 only know the images in their lookup tables.** A
+  database under a custom image name, a private mirror of an official image
+  (`registry.corp/postgres`), or an image outside the tables isn't checked.
+  KSEC-011 additionally doesn't cover images with a mandatory setting that
+  isn't a single env var (`elasticsearch` 8's discovery config), images
+  outside its three families (`couchdb`, `quay.io/bitnami/*`), checks
+  presence only (`ACCEPT_EULA: "N"` counts as set), and can't see a data directory whose `mountPath` is an unrendered
+  template placeholder (e.g. kubegres fixtures' `toBeReplaced`).
+- **KSEC-011 has the smallest mutation pool of any active rule** — 295
+  documents on the full corpus (KSEC-010: 1,137; the Bitnami/Percona/SQL
+  Server extension contributed 36 of the 295), since it needs a known
+  database server container that already sets its required variable. At the default `--total 2000` that's plenty (~160 per rule); at
+  much larger totals it caps and `_resolve_quotas` redistributes the rest to
+  other rules, so KSEC-011 ends up underrepresented.
+- **KSEC-006's Service check only sees one file.** A Service whose workload
+  lives in another file is never checked, and one that shares no label key
+  with any workload in its file is assumed to target such a workload (not
+  flagged). The flip side: a file that bundles a Service with an *unrelated*
+  workload using the same label keys gets flagged. Measured at directory
+  level on the corpus (sibling files, not one file), the check would fire
+  on 1,426 of 23,683 Services, mostly for exactly that reason — which is why
+  the training bundles are only ever built from matched pairs.
 - **`Job`/`CronJob` are excluded from KSEC-006** — their selector is
   normally auto-populated/immutable rather than hand-written, so a mismatch
   there isn't the same class of human error.
 - **KSEC-008's quantity parser** covers the common Kubernetes suffixes
   (`m`, `k`/`M`/`G`/`T`/`P`/`E`, `Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei`) but not
   exponential notation (`1e2`), which is valid but rare in practice.
-- **"Typo" injection (KSEC-009, currently disabled) is a single-edit-
+- **"Typo" injection (KSEC-009) is a single-edit-
   distance corruption**, not a model of realistic human typing errors (no
   keyboard-adjacency weighting, no common misspelling dictionary). It's a
   deliberately simple, fully automatable proxy for "looks right but isn't."
@@ -743,33 +949,13 @@ be valid after a later mutation touches a sibling field).
   minor realism/precision blemish in a small fraction of KSEC-001 examples.
   Restricting the harvest to keys that co-occur with a sibling `value` field
   (i.e. only the `{name, value}` env-var shape) would tighten this.
-- **`--mode rbac` generation would currently be pointless.** It exists to
-  feed KSEC-004, which is disabled — `pipeline.sh` no longer runs it by
-  default for exactly this reason; it's still available to run manually if
-  KSEC-004 gets re-enabled.
-- **The pipeline has never trained on a genuinely multi-document example.**
-  `dataset/build.py::load_records()` splits every multi-document corpus file
-  into separate, independent single-document records before anything else
-  runs — every training example ever produced has exactly one document, with
-  `"doc": 0` always, even though `SYSTEM_PROMPT` advertises multi-document
-  support. Found via two real `scenarios/` failures: a model's patch for a
-  `Service`'s selector used Deployment-style `matchLabels` syntax (a flat
-  `spec.selector` map doesn't have that field) since it's never seen a bare
-  Service as the subject of a finding, and a separate run mislabeled which
-  document a finding belonged to entirely. Fixing this means teaching
-  `build.py` to occasionally compose several independently-mutated documents
-  back into one genuinely multi-document example with correct `doc` indices
-  — a real, scoped feature addition, not yet implemented.
-- **`scanning.py`'s high-entropy fallback has a false-positive blind spot for
-  legitimate uppercase-hyphenated identifiers** — e.g. `SCRAM-SHA-256` (a
-  real, public MongoDB auth mechanism name) trips the entropy heuristic and
-  gets treated as a leaked secret, because `KEBAB_IDENTIFIER_RE`'s exclusion
-  is lowercase-only. Found via `scenarios/1-orion.yaml`: a model's patch
-  correctly externalized both real credentials, but the automated "is it
-  fixed" check kept failing because this unrelated value never stopped
-  looking like a secret. This costs real training data too — any corpus
-  document containing a similar identifier in a legitimate non-secret field
-  gets wrongly dropped as "dirty" during corpus filtering. Not yet fixed.
+- **Multi-document examples are assembled, not observed.** The corpus has no
+  multi-document files (see
+  [Why multi-document examples come from sibling files](#design-decisions-and-rationale)),
+  so every multi-document example is a workload + Service (+ sometimes one
+  other sibling) pairing from one repository directory. Files mixing
+  several workloads, or unrelated resources in a different order, are only
+  represented by the scenarios, not by training data.
 - **`scenarios/test_cases.yaml`'s "Erro de Sintaxe/Config" category (9 of its
   40 instances) is entirely outside the current 6-rule taxonomy** — typos,
   an invalid `volumeID`, a nonexistent command binary, and all 4

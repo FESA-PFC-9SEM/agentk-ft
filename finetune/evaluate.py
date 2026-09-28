@@ -233,15 +233,31 @@ def generate_response_text(
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
+def prompt_fits(tokenizer, system: str, user: str, max_seq_length: int, max_new_tokens: int) -> bool:
+    """Whether the prompt leaves room for max_new_tokens within max_seq_length.
+    The raw test split isn't length-filtered (only export_for_unsloth.py
+    drops over-long examples, from what the model trains on), so it holds a
+    long tail of huge manifests -- up to ~34k tokens on the v3 split, past
+    even the base model's 32k context -- that the model was never trained
+    on and generate() rejects outright."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return len(tokenizer(prompt, add_special_tokens=False)["input_ids"]) + max_new_tokens <= max_seq_length
+
+
 def run(args: argparse.Namespace) -> dict:
     model, tokenizer = load_model(args.adapter, args.max_seq_length)
     examples = load_test_examples(Path(args.test_file), args.limit)
 
     results = []
     details = []
+    skipped_too_long = 0
     for i, example in enumerate(examples):
         messages = example["messages"]
         system, user, assistant = (messages[0]["content"], messages[1]["content"], messages[2]["content"])
+        if not prompt_fits(tokenizer, system, user, args.max_seq_length, args.max_new_tokens):
+            skipped_too_long += 1
+            continue
         expected_response = json.loads(assistant)
         input_docs = parse_manifest(user)
 
@@ -252,9 +268,16 @@ def run(args: argparse.Namespace) -> dict:
 
         if (i + 1) % max(1, args.log_every) == 0:
             running_rate = sum(r["schema_valid"] for r in results) / len(results)
-            print(f"[{i + 1}/{len(examples)}] schema_valid_rate so far: {running_rate:.3f}")
+            print(f"[{i + 1}/{len(examples)}] schema_valid_rate so far: {running_rate:.3f}", flush=True)
 
     summary = aggregate_results(results)
+    summary["skipped_too_long"] = skipped_too_long
+    if skipped_too_long:
+        print(
+            f"Skipped {skipped_too_long} example(s) whose prompt + --max-new-tokens exceeds "
+            f"--max-seq-length {args.max_seq_length}.",
+            flush=True,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,7 +297,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--test-file", default="dataset/output/test.jsonl")
     parser.add_argument("--output-dir", default="finetune/output/eval")
     parser.add_argument("--max-seq-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=1280)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=20)
     return parser.parse_args(argv)

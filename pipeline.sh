@@ -11,11 +11,10 @@
 #   CORPUS_DIR, OUTPUT_DIR, SEED, N_BASE, N_HARD_NEGATIVE, TOTAL,
 #   LIMIT (real corpus rows read; empty = no limit), CONCURRENCY
 #
-# Note: RBAC generation (--mode rbac) is intentionally not run here. It exists
-# to feed KSEC-004, which is currently disabled (see README.md's "Active vs.
-# disabled rules") -- generating it would just be wasted GPU time until
-# KSEC-004 is re-enabled. Run `generation.generate --mode rbac` manually if
-# you need it for something else.
+# Note: RBAC generation (--mode rbac) is intentionally not run here. It was
+# built to feed KSEC-004, but the real corpus already has enough RBAC
+# documents (~3,900 KSEC-004 can mutate). Run `generation.generate --mode
+# rbac` manually if you want more RBAC variety.
 
 set -euo pipefail
 
