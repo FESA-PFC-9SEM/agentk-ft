@@ -37,6 +37,7 @@ from dataset.k8s import (
     parse_quantity,
     required_env_for_container,
 )
+from dataset.names import command_binary, container_strings, misspelled_binary, misspelled_path, paths_in
 from dataset.schema import Finding, escape_json_pointer_token, mask_evidence
 
 
@@ -427,6 +428,51 @@ def detect_ksec011(doc, doc_index: int = 0) -> list[Finding]:
     return findings
 
 
+def detect_ksec012(doc, doc_index: int = 0) -> list[Finding]:
+    """A command binary or file path that's a rare one-edit variant of a very
+    common one in the corpus (python5 for python3, /hom/ for /home/), or a
+    very common path under a wrong first directory -- see dataset/names.py.
+    At most one finding per field."""
+    findings = []
+    pod_spec, prefix = get_pod_spec(doc)
+    if pod_spec is None:
+        return findings
+    for cpath, container in iter_containers(pod_spec, prefix):
+        flagged = set()
+        binary = command_binary(container)
+        if binary and (fix := misspelled_binary(binary)):
+            pointer = f"{cpath}/command/0"
+            flagged.add(pointer)
+            findings.append(
+                Finding(
+                    "KSEC-012",
+                    "high",
+                    doc_index,
+                    pointer,
+                    f"Command '{binary}' looks like a misspelling of '{fix}' -- the container fails to start",
+                    mask_evidence(binary),
+                )
+            )
+        for pointer, text in container_strings(cpath, container):
+            if pointer in flagged:
+                continue
+            for path in paths_in(text):
+                fix = misspelled_path(path)
+                if fix:
+                    findings.append(
+                        Finding(
+                            "KSEC-012",
+                            "high" if "/command/" in pointer else "medium",
+                            doc_index,
+                            pointer,
+                            f"Path '{path}' looks like a misspelling of '{fix}'",
+                            mask_evidence(path),
+                        )
+                    )
+                    break
+    return findings
+
+
 _STRUCTURAL_DETECTORS = (detect_ksec002, detect_ksec003, detect_ksec004, detect_ksec005)
 _SEMANTIC_DETECTORS = (
     detect_ksec006,
@@ -435,6 +481,7 @@ _SEMANTIC_DETECTORS = (
     detect_ksec009,
     detect_ksec010,
     detect_ksec011,
+    detect_ksec012,
 )
 
 

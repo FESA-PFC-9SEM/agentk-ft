@@ -10,6 +10,8 @@ from dataset.mutate import (
     _fake_secret_value,
     _mutate_ksec001_command,
     _mutate_ksec001_env,
+    _mutate_ksec001_env_in_place,
+    _mutate_ksec001_url,
     _typo,
     mutate_ksec001,
     mutate_ksec002,
@@ -124,13 +126,18 @@ def test_ksec001_command_round_trip_no_prior_args():
     assert "args" not in result.canonical["spec"]["containers"][0]
 
 
-def test_ksec001_command_round_trip_appends_to_existing_args():
-    rng = random.Random(4)
-    doc = _pod({"args": ["--verbose"]})
-    result = _mutate_ksec001_command(doc, rng, 0)
-    assert result is not None
-    _assert_round_trip(result)
-    assert result.mutated_doc["spec"]["containers"][0]["args"][0] == "--verbose"
+def test_ksec001_command_round_trip_inserts_into_existing_args():
+    positions = set()
+    for seed in range(40):
+        doc = _pod({"args": ["--verbose", "--port", "8080"]})
+        result = _mutate_ksec001_command(doc, random.Random(seed), 0)
+        assert result is not None
+        _assert_round_trip(result)
+        args = result.mutated_doc["spec"]["containers"][0]["args"]
+        # The original args keep their relative order around the insertion.
+        assert [a for a in args if a in ("--verbose", "--port", "8080")] == ["--verbose", "--port", "8080"]
+        positions.add(args.index("--verbose"))
+    assert len(positions) > 1  # not always appended at the end
 
 
 def test_ksec001_command_prefers_existing_command_list():
@@ -977,3 +984,52 @@ def test_ksec006_service_mutation_not_applicable():
     assert mutate_ksec006_service([_service_file()[0]], random.Random(0)) is None
     assert mutate_ksec006_service(_service_file(selector={"component": "db"}), random.Random(0)) is None
     assert mutate_ksec006_service(_service_file(selector={"app": "wbe"}), random.Random(0)) is None
+
+
+def _env_deployment(env):
+    return _db_deployment("mongo:7.0", {"env": env})
+
+
+@pytest.mark.parametrize("seed", range(15))
+def test_ksec001_in_place_leaks_an_existing_secret_ref_and_restores_it(seed):
+    ref = {"name": "MONGO_INITDB_ROOT_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "mongo", "key": "pw"}}}
+    env = [{"name": "MONGO_INITDB_ROOT_USERNAME", "value": "admin"}, ref, {"name": "TZ", "value": "UTC"}]
+    doc = _env_deployment(env)
+    result = _mutate_ksec001_env_in_place(doc, random.Random(seed), 0)
+    _assert_round_trip(result)
+    assert result.canonical == doc and result.new_resources == []
+    leaked = _env_of(result.mutated_doc)[1]
+    assert leaked["name"] == "MONGO_INITDB_ROOT_PASSWORD" and "value" in leaked  # same name, same position
+    assert result.findings[0].path.endswith("/env/1/value")
+
+
+def test_ksec001_in_place_needs_a_credential_secret_ref():
+    not_credential = [{"name": "MONGO_DB", "valueFrom": {"secretKeyRef": {"name": "m", "key": "db"}}}]
+    assert _mutate_ksec001_env_in_place(_env_deployment(not_credential), random.Random(0), 0) is None
+
+
+@pytest.mark.parametrize("seed", range(15))
+def test_ksec001_url_embeds_credentials_and_fixes_forward(seed):
+    env = [{"name": "MONGODB_URL", "value": "mongodb://mongodb-service:27017/admin"}]
+    doc = _env_deployment(env)
+    result = _mutate_ksec001_url(doc, random.Random(seed), 0)
+    _assert_round_trip(result)
+    assert "@mongodb-service:27017/admin" in _env_of(result.mutated_doc)[0]["value"]
+    assert "connection string" in result.findings[0].message
+    assert _env_of(result.canonical)[0]["valueFrom"]["secretKeyRef"]["key"] == "mongodb-url"
+    assert len(result.new_resources) == 1
+
+
+def test_ksec001_url_skips_urls_that_already_have_credentials_or_no_scheme():
+    for value in ("mongodb://u:p@db:27017", "http://web:8080", "db:27017"):
+        assert _mutate_ksec001_url(_env_deployment([{"name": "URL", "value": value}]), random.Random(0), 0) is None
+
+
+def test_ksec005_can_unpin_a_second_image_in_the_same_manifest():
+    doc = _deployment({"image": "nginx:1.25"})
+    doc["spec"]["template"]["spec"]["initContainers"] = [{"name": "init", "image": "busybox:1.36"}]
+    first = mutate_ksec005(doc, random.Random(0))
+    second = mutate_ksec005(first.mutated_doc, random.Random(1))
+    assert second is not None and len(second.findings) == 1
+    assert second.findings[0].path != first.findings[0].path
+    assert len(detect_all(second.mutated_doc)) == 2

@@ -76,6 +76,25 @@ class MultiMutationResult:
     applied_rule_ids: list[str] = field(default_factory=list)
 
 
+def _round_trips(mutated_docs: list[dict], patch: list[PatchOp], canonical_docs: list[dict], single: bool = False) -> bool:
+    """Whether the chained patch, applied per document, reproduces the
+    running canonical exactly. Checked after every composition step: a step
+    whose own fix changes a list's length in the canonical (KSEC-011
+    collapsing several password entries into one) can leave an EARLIER
+    step's index-based op pointing past the end -- found on a full build
+    once KSEC-012 started fixing env values by index. Any such interaction
+    rejects just that step instead of failing the whole build."""
+    try:
+        reconstructed = list(mutated_docs)
+        for i in range(len(mutated_docs)):
+            ops = [{k: v for k, v in op.to_dict().items() if k != "doc"} for op in patch if single or op.doc == i]
+            if ops:
+                reconstructed[i] = jsonpatch.apply_patch(mutated_docs[i], ops)
+        return reconstructed == canonical_docs
+    except Exception:
+        return False
+
+
 def mutate_multi_defect(
     canonical_doc: dict,
     rng: random.Random,
@@ -124,8 +143,7 @@ def mutate_multi_defect(
         # Undoing N chained mutations means undoing the most recent one
         # first, so each new stage's patch goes in front of what came
         # before it.
-        patch = result.patch + patch
-        new_resources += result.new_resources
+        new_patch = result.patch + patch
 
         # Most mutators' own "canonical" is just their input doc unchanged --
         # undoing the injected defect reproduces it exactly. KSEC-001's
@@ -137,9 +155,16 @@ def mutate_multi_defect(
         # KSEC-001 here -- and replaying the same diff against the running
         # canonical carries it into the final target.
         canonical_delta = jsonpatch.make_patch(current_doc, result.canonical).patch
-        if canonical_delta:
-            running_canonical = jsonpatch.apply_patch(running_canonical, canonical_delta)
+        try:
+            new_canonical = jsonpatch.apply_patch(running_canonical, canonical_delta) if canonical_delta else running_canonical
+        except Exception:
+            continue
+        if not _round_trips([result.mutated_doc], new_patch, [new_canonical], single=True):
+            continue
 
+        patch = new_patch
+        new_resources += result.new_resources
+        running_canonical = new_canonical
         current_doc = result.mutated_doc
         applied_rule_ids.append(rule_id)
 
@@ -274,12 +299,20 @@ def mutate_multi_defect_file(
         result = _apply_file_step(current, rng, step, ksec001_candidate_names)
         if result is None:
             continue
-        patch = result.patch + patch
+        new_patch = result.patch + patch
+        new_canonical = list(running_canonical)
+        try:
+            for i, (before, target) in enumerate(zip(current, result.canonical_docs)):
+                delta = jsonpatch.make_patch(before, target).patch
+                if delta:
+                    new_canonical[i] = jsonpatch.apply_patch(new_canonical[i], delta)
+        except Exception:
+            continue
+        if not _round_trips(result.mutated_docs, new_patch, new_canonical):
+            continue
+        patch = new_patch
         new_resources += result.new_resources
-        for i, (before, target) in enumerate(zip(current, result.canonical_docs)):
-            delta = jsonpatch.make_patch(before, target).patch
-            if delta:
-                running_canonical[i] = jsonpatch.apply_patch(running_canonical[i], delta)
+        running_canonical = new_canonical
         current = result.mutated_docs
         applied_rule_ids.append(_step_rule_id(step))
         expected_findings += len(result.findings)

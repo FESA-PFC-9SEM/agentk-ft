@@ -197,8 +197,46 @@ def test_score_run_uses_cross_document_detection_for_service_selectors():
         patch=[{"doc": 0, "op": "replace", "path": "/spec/selector/app", "value": "web"}],
     )
     result = score_run(docs, [instance], json.dumps(output))
-    assert result["instances"][1] == {"detected": True, "corrected": True, "applicable": True}
+    assert result["instances"][1] == {"detected": True, "corrected": True, "corrected_per_finding": True, "applicable": True}
 
     unfixed = dict(output, patch=[])
     result = score_run(docs, [instance], json.dumps(unfixed))
     assert result["instances"][1]["corrected"] is False
+
+
+def test_per_finding_correction_survives_an_unrelated_bad_op():
+    # 5-nginx shape: a correct fix plus one op on a path that doesn't exist.
+    # Strict scoring rejects the whole patch; per-finding scoring credits the fix.
+    docs = [
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "c", "image": "nginx"}]},
+        }
+    ]
+    instance = _instance(1, "KSEC-005", doc=0, category="Imagem sem Tag")
+    output = dict(
+        CLEAN,
+        findings=[
+            _finding("KSEC-005", doc=0, path="/spec/containers/0/image"),
+            _finding("KSEC-006", doc=0, path="/spec/template/spec/labels/app"),
+        ],
+        patch=[
+            {"doc": 0, "op": "replace", "path": "/spec/containers/0/image", "value": "nginx:1.25"},
+            {"doc": 0, "op": "replace", "path": "/spec/template/spec/labels/app", "value": "x"},
+        ],
+    )
+    result = score_run(docs, [instance], json.dumps(output))
+    assert result["patch_applies"] is False
+    assert result["instances"][1]["corrected"] is False
+    assert result["instances"][1]["corrected_per_finding"] is True
+
+
+def test_per_finding_correction_needs_a_matching_finding():
+    docs = [{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "image": "nginx"}]}}]
+    instance = _instance(1, "KSEC-005", doc=0, category="Imagem sem Tag")
+    output = dict(CLEAN, patch=[{"doc": 0, "op": "replace", "path": "/spec/containers/0/image", "value": "nginx:1.25"}])
+    result = score_run(docs, [instance], json.dumps(output))
+    # The strict score still credits a fix without a finding; per-finding follows it.
+    assert result["instances"][1]["corrected"] == result["instances"][1]["corrected_per_finding"]

@@ -103,6 +103,7 @@ A clean manifest has all four arrays empty.
 | **KSEC-009** | Dangling volume reference — a `volumeMount.name` doesn't match any declared `volumes[].name` (or, on a `StatefulSet`, any `volumeClaimTemplates[].metadata.name`), generated via a single human-plausible character edit (transpose/delete/duplicate) of a real volume name. | Revert to the correct name. | **active** |
 | **KSEC-010** | Probe protocol mismatch — an `httpGet` liveness/readiness/startup probe on a container whose image is a non-HTTP server (`postgres`, `mysql`, `mariadb`, `redis`, `mongo`, `memcached`, incl. vendor rebuilds like `bitnami/postgresql`). The probe can never succeed: liveness/startup → restart loop (`high`), readiness → never Ready (`medium`). | Replace `httpGet` with `tcpSocket` on the same port (or restore the original `exec` check). | **active** |
 | **KSEC-011** | Missing required env var for the image — a database server container without a variable its entrypoint requires. Covers official `postgres`/`mysql`/`mariadb`/`percona` (+ `percona/percona-server`), Bitnami `postgresql`/`mysql`/`mariadb`/`redis`/`mongodb` (password or `ALLOW_EMPTY_PASSWORD`; replicas skipped), and Microsoft SQL Server (`mcr.microsoft.com/mssql/server`, `azure-sql-edge`: `ACCEPT_EULA` **and** an SA password — two independent findings). Accepted alternatives such as `*_FILE` satisfy it. The container exits at startup. | Passwords: add the variable from a `Secret` (`secretKeyRef`) + a placeholder `Secret` in `new_resources` — the same shape as KSEC-001's externalization. `ACCEPT_EULA`: add `value: "Y"`. | **active** |
+| **KSEC-012** | Misspelled name — a command binary or a path in `command`/`args`/env that is *rare* in the real corpus but one character-slip from a *very common* one (`python5` → `python3`, `/hom/` → `/home/`), or a very common deep path under a wrong first directory (`/variavel/run/secrets/kubernetes.io/...`). The vocabulary is counted from the corpus (`dataset/name_vocab.json`), not hand-written. | Restore the intended name. | **active** |
 
 Severities are assigned per finding sub-case (e.g. `privileged: true` is
 `critical`, `allowPrivilegeEscalation: true` is `medium`) — see
@@ -174,6 +175,7 @@ The critical path: turns the real corpus into `dataset.jsonl`.
 | `schema.py` | System prompt, rule taxonomy, response dataclasses, validator. |
 | `scanning.py` | Real-secret detection: sensitive-key regex, Shannon entropy, connection-string/PEM patterns, placeholder allowlist, and a dedicated scan of `command`/`args` for CLI-embedded credentials. Correctly resolves the Kubernetes `{name: X, value: Y}` env-var pattern (this is the single most important correctness property in the project — see `test_env_name_value_pair`). |
 | `k8s.py` | Shared, read-only Kubernetes navigation helpers: `get_pod_spec` (resolves the PodSpec location per kind, including the 4-levels-deep CronJob case), `iter_containers`, `get_selector_match_labels`, `get_template_labels`, `get_pod_labels`/`get_service_selector` (for the cross-document Service check), `get_container_ports`, `parse_quantity` (Kubernetes resource-quantity parser), image tag helpers, sensitive-hostpath check. |
+| `names.py` | Corpus-derived name vocabulary (command binaries, first path directories, common deep path prefixes; rebuilt with `python -m dataset.names` into `name_vocab.json`) and the misspelled-name check behind KSEC-012. |
 | `detect.py` | One read-only detector per rule (`detect_ksec001`..`detect_ksec011`), plus `detect_structural` (002-005), `detect_semantic` (006-011), `detect_all` (one document) and `detect_file` (a whole multi-document file: every document's findings tagged with its index, plus the cross-document KSEC-006 Service check). Used for filtering dirty corpus docs, mutator preconditions, post-normalize assertions and scenario scoring. |
 | `dedup.py` | Structural deduplication — reduces a document to a "skeleton" (strips names/namespaces/labels/annotations/selectors, collapses leaf values to placeholders) and hashes it. Two manifests differing only in naming collide. |
 | `normalize.py` | Produces the canonical hardened form — the gold target. Deterministic, idempotent. Only fixes rules 002-005 forward (see rationale below); KSEC-001 docs are dropped rather than fixed. |
@@ -271,6 +273,26 @@ re-derives the final finding set by re-running the detectors
 that module's docstring for why this composition is safe (each rule injects
 into a disjoint structural area, so injecting rule B never dirties rule A's
 already-injected field).
+
+**More realistic defect placement (v5).** v4 still never detected five
+scenario errors in any of 5 runs, and each traced back to *where* the
+pipeline put its defects rather than to a missing rule: KSEC-001 always
+appended a new fake variable at the end of the env list (real leaks are the
+app's own variable, anywhere in the list — `MONGO_INITDB_ROOT_PASSWORD`) and
+always appended CLI credentials at the end of `args` (orion's `-dbpwd` sits
+mid-list); credentials were never embedded in a URL the manifest already had
+(`MONGODB_URL`); and KSEC-005's hard precondition meant no example ever had
+*two* untagged images (7-elasticsearch's app + `busybox` init container).
+v5 adds those shapes — an existing `secretKeyRef` credential leaked in place
+(fix: restore the reference), credentials embedded in an existing
+database/broker URL (fix: move the URL into a Secret), CLI credentials at a
+random position (never before an index an earlier step's finding points at,
+so chained patches stay valid), and a repeatable KSEC-005 — plus KSEC-012
+for the three misspelled names. KSEC-012 is deliberately generic: a name is
+suspicious only if it's rare in the corpus and one slip from a very common
+one, so it catches `pyhton3` or `/ect/` just as well as the scenario's
+`python5`; on the deduplicated corpus it fires on 21 of 36,172 manifests,
+after excluding naming-style variants (`/target1`, `/work_dir`, plurals).
 
 **Which rules and how many (v4).** The v3 dataset drew rules uniformly and
 2–4 defects per example. Tested on `scenarios/`, the model trained on it
@@ -561,7 +583,7 @@ export PATH="$PATH:$(go env GOPATH)/bin"   # for the two kubeconform integration
 .venv/bin/python -m pytest dataset/ generation/ -q
 ```
 
-930 tests, covering:
+1017 tests, covering:
 - Unit tests per detector/mutator (including the
   critical `{name, value}` env-var case, and RFC 6901 escaping for
   slash-containing label keys).

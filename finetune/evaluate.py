@@ -87,6 +87,21 @@ def apply_multidoc_patch(docs: list, patch: list[dict]) -> tuple[list | None, bo
         return None, False
 
 
+def patch_ops_for_finding(finding: dict, patch_ops: list[dict]) -> list[dict]:
+    """Which patch ops implement a given finding's fix, so a UI can offer
+    "apply just this finding". A patch op relates to a finding if they're in
+    the same doc and the op's path is the finding's path or an ancestor of it
+    -- mutators sometimes replace a whole list element (e.g. `.../env/1`) to
+    fix something a finding reports more specifically (`.../env/1/value`)."""
+    doc = finding.get("doc", 0)
+    fpath = finding.get("path", "")
+    return [
+        op
+        for op in patch_ops
+        if op.get("doc", 0) == doc and (fpath == op.get("path", "") or fpath.startswith(op.get("path", "") + "/"))
+    ]
+
+
 def evaluate_example(input_docs: dict | list, expected_response: dict, model_output_text: str) -> dict:
     """Pure scoring for one example -- no model/network involved. Compares
     the model's parsed response against this example's ground truth.

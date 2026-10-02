@@ -43,6 +43,10 @@ RULES = {
                 "postgresql/mysql/mariadb/redis/mongodb, or Microsoft SQL Server -- "
                 "without a variable its entrypoint requires, e.g. POSTGRES_PASSWORD, "
                 "REDIS_PASSWORD or ACCEPT_EULA; add passwords from a Secret)",
+    "KSEC-012": "Misspelled name (a command binary or file path that is a one-character "
+                "slip of a very common one, e.g. python5 for python3 or /hom/ for /home/, "
+                "or a well-known path under a wrong first directory -- the container "
+                "fails at runtime; restore the intended name)",
 }
 # Rules can be disabled from generation without deleting their tested code:
 # remove the entry here AND from dataset/mutate.py's MUTATORS. SYSTEM_PROMPT

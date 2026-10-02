@@ -23,6 +23,8 @@ import re
 import string
 from dataclasses import dataclass, field
 
+import jsonpatch
+
 from dataset.detect import (
     detect_all,
     detect_ksec001,
@@ -37,6 +39,7 @@ from dataset.detect import (
     detect_ksec010,
     detect_ksec011,
     detect_ksec006_services,
+    detect_ksec012,
 )
 from dataset.k8s import (
     NON_HTTP_IMAGE_PORTS,
@@ -60,6 +63,8 @@ from dataset.k8s import (
     required_env_for_container,
     split_image,
 )
+from dataset import names
+from dataset.scanning import CONN_STRING_RE, NON_SECRET_KEY_SUFFIX_RE, SENSITIVE_KEY_RE
 from dataset.schema import RULE_IDS, Finding, PatchOp, escape_json_pointer_token
 
 
@@ -477,13 +482,31 @@ def _mutate_ksec001_command(canonical_doc: dict, rng: random.Random, doc_index: 
     injected = template(fake)
     items = injected if isinstance(injected, list) else [injected]
 
-    patch_op = _append_list_item_with_patch(m_container, orig_container, list_key, items[0], cpath, doc_index)
-    m_container[list_key].extend(items[1:])
-    # Removing the first appended index once per item undoes the whole append
-    # (each removal shifts the next item into that index); if the list itself
-    # was new, the single "remove the key" op already covers every item.
+    # Inserted at a random position, not only appended: real manifests carry
+    # the credential mid-list (scenarios/1-orion.yaml's `-dbpwd 123456789`
+    # sits between other flags), and a model that only ever saw it at the end
+    # missed it. Never before an index an existing finding in this list points
+    # at (an earlier step of a multi-defect composition) -- that would shift
+    # the element out from under that step's own patch. A `command` keeps its
+    # executable at index 0.
     list_existed = isinstance(orig_container.get(list_key), list)
-    patch = [copy.deepcopy(patch_op) for _ in items] if list_existed else [patch_op]
+    current = orig_container.get(list_key) if list_existed else []
+    list_prefix = f"{cpath}/{list_key}/"
+    taken = [
+        int(f.path[len(list_prefix):].split("/")[0])
+        for f in detect_all(canonical_doc, doc_index)
+        if f.path.startswith(list_prefix) and f.path[len(list_prefix):].split("/")[0].isdigit()
+    ]
+    lowest = max(taken) + 1 if taken else (1 if list_key == "command" else 0)
+    insert_at = rng.randint(min(lowest, len(current)), len(current))
+    m_container.setdefault(list_key, [])[insert_at:insert_at] = items
+    # Removing the inserted index once per item undoes the whole insertion
+    # (each removal shifts the next item into that index); if the list itself
+    # was new, a single "remove the key" op covers every item.
+    if list_existed:
+        patch = [PatchOp(doc_index, "remove", f"{list_prefix}{insert_at}") for _ in items]
+    else:
+        patch = [PatchOp(doc_index, "remove", f"{cpath}/{list_key}")]
 
     # A client-style arg (e.g. `curl ...`) as the first arg turns a database
     # server container into what KSEC-011 treats as a client job, silently
@@ -494,10 +517,114 @@ def _mutate_ksec001_command(canonical_doc: dict, rng: random.Random, doc_index: 
     ):
         return None
 
-    findings = detect_ksec001(mutated_doc, doc_index)
+    existing = detect_ksec001(canonical_doc, doc_index)
+    findings = [f for f in detect_ksec001(mutated_doc, doc_index) if f not in existing]
     assert findings, "KSEC-001 command mutation produced no finding"
 
     return MutationResult(mutated_doc, canonical_doc, findings, patch, [])
+
+
+def _is_credential_name(name) -> bool:
+    return isinstance(name, str) and bool(SENSITIVE_KEY_RE.search(name)) and not NON_SECRET_KEY_SUFFIX_RE.search(name)
+
+
+def _env_entries(canonical_doc: dict):
+    """(container index, cpath, env index, entry) for every env entry of every container."""
+    pod_spec, prefix = get_pod_spec(canonical_doc)
+    if pod_spec is None:
+        return
+    for c_idx, (cpath, container) in enumerate(iter_containers(pod_spec, prefix)):
+        env = container.get("env")
+        if isinstance(env, list):
+            for e_idx, entry in enumerate(env):
+                if isinstance(entry, dict):
+                    yield c_idx, cpath, e_idx, entry
+
+
+def _env_entry(doc: dict, c_idx: int, e_idx: int) -> dict:
+    pod_spec, prefix = get_pod_spec(doc)
+    _, container = list(iter_containers(pod_spec, prefix))[c_idx]
+    return container["env"][e_idx]
+
+
+def _mutate_ksec001_env_in_place(canonical_doc: dict, rng: random.Random, doc_index: int) -> MutationResult | None:
+    """Turns a credential variable the manifest ALREADY has (read from a
+    Secret via secretKeyRef) into a plaintext literal, in place -- the app's
+    own variable name at its real position in the env list, which is what a
+    real leak looks like (scenarios/10-mongodb.yaml's
+    MONGO_INITDB_ROOT_PASSWORD), unlike the appended fake variable of
+    _mutate_ksec001_env. The fix restores the original reference: the
+    Secret already exists, so no new resource."""
+    existing = detect_ksec001(canonical_doc, doc_index)
+    candidates = [
+        (c_idx, cpath, e_idx, entry)
+        for c_idx, cpath, e_idx, entry in _env_entries(canonical_doc)
+        if _is_credential_name(entry.get("name"))
+        and isinstance((entry.get("valueFrom") or {}).get("secretKeyRef"), dict)
+    ]
+    if not candidates:
+        return None
+    c_idx, cpath, e_idx, entry = rng.choice(candidates)
+    mutated_doc = copy.deepcopy(canonical_doc)
+    pod_spec, prefix = get_pod_spec(mutated_doc)
+    _, m_container = list(iter_containers(pod_spec, prefix))[c_idx]
+    m_container["env"][e_idx] = {"name": entry["name"], "value": _fake_secret_value(rng)}
+    findings = [f for f in detect_ksec001(mutated_doc, doc_index) if f not in existing]
+    if len(findings) != 1:
+        return None
+    patch = [PatchOp(doc_index, "replace", f"{cpath}/env/{e_idx}", copy.deepcopy(entry))]
+    return MutationResult(mutated_doc, canonical_doc, findings, patch, [])
+
+
+_CREDENTIAL_LESS_URL_RE = re.compile(
+    r"^(?P<scheme>mongodb(\+srv)?|postgres(ql)?|mysql|mariadb|redis|rediss|amqps?|nats|mssql)://(?P<rest>[^\s@/]+(/\S*)?)$"
+)
+_URL_USERS = ("admin", "root", "app", "user", "service")
+
+
+def _mutate_ksec001_url(canonical_doc: dict, rng: random.Random, doc_index: int) -> MutationResult | None:
+    """Embeds credentials into a database/broker URL the manifest already
+    has (mongodb://db:27017 -> mongodb://admin:<pw>@db:27017), as in
+    scenarios/10-mongodb.yaml's MONGODB_URL. Fixed forward like
+    _mutate_ksec001_env: the whole URL moves into a Secret referenced by
+    secretKeyRef, plus the placeholder Secret."""
+    existing = detect_ksec001(canonical_doc, doc_index)
+    candidates = [
+        (c_idx, cpath, e_idx, entry, m)
+        for c_idx, cpath, e_idx, entry in _env_entries(canonical_doc)
+        if isinstance(entry.get("name"), str)
+        and isinstance(entry.get("value"), str)
+        and (m := _CREDENTIAL_LESS_URL_RE.match(entry["value"]))
+    ]
+    if not candidates:
+        return None
+    c_idx, cpath, e_idx, entry, m = rng.choice(candidates)
+    for _ in range(5):
+        password = _fake_secret_value(rng, cli_safe=True)
+        url = f"{m['scheme']}://{rng.choice(_URL_USERS)}:{password}@{m['rest']}"
+        if CONN_STRING_RE.match(url):
+            break
+    else:
+        return None
+
+    pod_spec, prefix = get_pod_spec(canonical_doc)
+    _, orig_container = list(iter_containers(pod_spec, prefix))[c_idx]
+    secret_name = f"{orig_container.get('name', 'app')}-secrets"
+    secret_key = entry["name"].lower().replace("_", "-")
+    hardened = {"name": entry["name"], "valueFrom": {"secretKeyRef": {"name": secret_name, "key": secret_key}}}
+
+    canonical = copy.deepcopy(canonical_doc)
+    c_pod_spec, _ = get_pod_spec(canonical)
+    list(iter_containers(c_pod_spec, prefix))[c_idx][1]["env"][e_idx] = hardened
+    mutated_doc = copy.deepcopy(canonical_doc)
+    m_pod_spec, _ = get_pod_spec(mutated_doc)
+    list(iter_containers(m_pod_spec, prefix))[c_idx][1]["env"][e_idx] = {"name": entry["name"], "value": url}
+
+    findings = [f for f in detect_ksec001(mutated_doc, doc_index) if f not in existing]
+    if len(findings) != 1:
+        return None
+    patch = [PatchOp(doc_index, "replace", f"{cpath}/env/{e_idx}", hardened)]
+    return MutationResult(mutated_doc, canonical, findings, patch, [_placeholder_secret_yaml(canonical_doc, secret_name, secret_key)])
 
 
 def mutate_ksec001(
@@ -509,7 +636,20 @@ def mutate_ksec001(
     fixed built-in list."""
 
     def call_env():
-        return _mutate_ksec001_env(canonical_doc, rng, doc_index, candidate_names=candidate_names)
+        # Three env shapes, in random order until one applies: a new
+        # variable appended, an existing secretKeyRef variable leaked in
+        # place, or credentials embedded in an existing URL.
+        shapes = [
+            lambda: _mutate_ksec001_env(canonical_doc, rng, doc_index, candidate_names=candidate_names),
+            lambda: _mutate_ksec001_env_in_place(canonical_doc, rng, doc_index),
+            lambda: _mutate_ksec001_url(canonical_doc, rng, doc_index),
+        ]
+        rng.shuffle(shapes)
+        for shape in shapes:
+            result = shape()
+            if result is not None:
+                return result
+        return None
 
     def call_command():
         return _mutate_ksec001_command(canonical_doc, rng, doc_index)
@@ -686,7 +826,14 @@ def _is_conventionally_tagged(image: str) -> bool:
 
 
 def mutate_ksec005(canonical_doc: dict, rng: random.Random, doc_index: int = 0) -> MutationResult | None:
-    assert not detect_ksec005(canonical_doc, doc_index), "canonical already has a KSEC-005 finding"
+    """Unpins one still-pinned image. Repeatable within a manifest: the
+    candidates are only containers whose image is still conventionally
+    tagged, so a second call in a multi-defect composition unpins a
+    different container -- a manifest with two untagged images (an app plus
+    a `busybox` init container, as in scenarios/7-elasticsearch.yaml) is
+    common in practice, and a model that only ever saw one per manifest
+    stopped after reporting the first."""
+    existing = detect_ksec005(canonical_doc, doc_index)
 
     pod_spec, prefix = get_pod_spec(canonical_doc)
     if pod_spec is None:
@@ -722,8 +869,8 @@ def mutate_ksec005(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
 
     patch_op = _set_field_with_patch(m_container, orig_container, cpath, ["image"], new_image, doc_index)
 
-    findings = detect_ksec005(mutated_doc, doc_index)
-    assert findings, "KSEC-005 mutation produced no finding"
+    findings = [f for f in detect_ksec005(mutated_doc, doc_index) if f not in existing]
+    assert len(findings) == 1, "KSEC-005 mutation should add exactly one finding"
 
     return MutationResult(mutated_doc, canonical_doc, findings, [patch_op], [])
 
@@ -1116,6 +1263,10 @@ def mutate_ksec011(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
     if pod_spec is None:
         return None
 
+    # An entry already carrying a plaintext credential (KSEC-001's in-place
+    # variant leaks e.g. POSTGRES_PASSWORD itself) is never removed here:
+    # that would erase the KSEC-001 finding along with it.
+    leaked = {f.path for f in detect_ksec001(canonical_doc, doc_index)}
     candidates = []  # (container idx, cpath, container name, requirement, satisfying env indices)
     for idx, (cpath, container) in enumerate(iter_containers(pod_spec, prefix)):
         applicable = required_env_for_container(cpath, container, pod_spec)
@@ -1124,7 +1275,7 @@ def mutate_ksec011(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
             continue
         for requirement in applicable[1]:
             satisfying = [i for i, e in enumerate(env) if isinstance(e, dict) and e.get("name") in requirement.accepted]
-            if satisfying:
+            if satisfying and not any(f"{cpath}/env/{i}/value" in leaked for i in satisfying):
                 candidates.append((idx, cpath, container.get("name") or "app", requirement, satisfying))
     if not candidates:
         return None
@@ -1171,6 +1322,67 @@ def mutate_ksec011(canonical_doc: dict, rng: random.Random, doc_index: int = 0) 
     assert len(findings) == 1, "KSEC-011 mutation should produce exactly one finding"
 
     return MutationResult(mutated_doc, canonical, findings, patch, new_resources)
+
+
+def _misspell(token: str, rng: random.Random) -> str:
+    """One human-plausible slip: _typo's transpose/delete/duplicate, or a
+    substituted character (a digit for another digit -- python3 -> python5)."""
+    if rng.random() < 0.6:
+        return _typo(token, rng)
+    i = rng.randrange(len(token))
+    pool = string.digits if token[i].isdigit() else string.ascii_lowercase
+    return token[:i] + rng.choice([c for c in pool if c != token[i].lower()]) + token[i + 1 :]
+
+
+def mutate_ksec012(canonical_doc: dict, rng: random.Random, doc_index: int = 0) -> MutationResult | None:
+    """Misspells a name the corpus treats as very common: a container's
+    command binary (python3 -> python5) or the first directory of a path in
+    command/args/env (/home -> /hom). For a very common deep path
+    (/var/run/secrets/kubernetes.io/...), the first directory may instead be
+    replaced by a longer word-like variant (/varia/run/secrets/...), the
+    shape of scenarios/7-elasticsearch.yaml's /variavel/. The fix restores
+    the original string."""
+    if detect_ksec012(canonical_doc, doc_index):
+        return None
+    pod_spec, prefix = get_pod_spec(canonical_doc)
+    if pod_spec is None:
+        return None
+    vocab = names.load_vocab()
+    candidates = []  # (pointer, original string, token, kind)
+    for cpath, container in iter_containers(pod_spec, prefix):
+        binary = names.command_binary(container)
+        if binary and len(binary) >= names.MIN_BINARY_LEN and vocab["binaries"].get(binary, 0) >= names.COMMON_MIN:
+            candidates.append((f"{cpath}/command/0", container["command"][0], binary, "binary"))
+        for pointer, text in names.container_strings(cpath, container):
+            for path in names.paths_in(text):
+                first = path.strip("/").split("/")[0]
+                if len(first) >= names.MIN_LEN and vocab["path_segments"].get(first, 0) >= names.COMMON_MIN:
+                    candidates.append((pointer, text, path, "path"))
+    if not candidates:
+        return None
+
+    pointer, text, token, kind = rng.choice(candidates)
+    for _ in range(8):
+        if kind == "binary":
+            new_token = _misspell(token, rng)
+            new_text = text[: len(text) - len(token)] + new_token
+        else:
+            parts = token.strip("/").split("/")
+            tail = "/".join(parts[1 : names.MAX_PREFIX_DEPTH])
+            deep_common = any(tail.startswith(t) for t in vocab["common_tails"] if t.count("/") >= 2)
+            if deep_common and rng.random() < 0.4:
+                new_first = parts[0] + "".join(rng.choice(string.ascii_lowercase) for _ in range(rng.randint(2, 5)))
+            else:
+                new_first = _misspell(parts[0], rng)
+            new_token = "/" + "/".join([new_first, *parts[1:]])
+            new_text = text.replace(token, new_token, 1)
+        if new_text == text:
+            continue
+        mutated_doc = jsonpatch.apply_patch(canonical_doc, [{"op": "replace", "path": pointer, "value": new_text}])
+        findings = detect_ksec012(mutated_doc, doc_index)
+        if len(findings) == 1 and findings[0].path == pointer:
+            return MutationResult(mutated_doc, canonical_doc, findings, [PatchOp(doc_index, "replace", pointer, text)], [])
+    return None
 
 
 def _other_rule_counts(doc: dict, rule_id: str, doc_index: int) -> collections.Counter:
@@ -1222,5 +1434,6 @@ MUTATORS = {
         ("KSEC-009", mutate_ksec009),
         ("KSEC-010", mutate_ksec010),
         ("KSEC-011", mutate_ksec011),
+        ("KSEC-012", mutate_ksec012),
     )
 }

@@ -285,6 +285,7 @@ def _files():
     db_pod_spec = db["spec"]["template"]["spec"]
     db_pod_spec["containers"][0]["volumeMounts"] = [{"name": "data", "mountPath": "/var/lib/postgresql/data"}]
     db_pod_spec["volumes"] = [{"name": "data", "emptyDir": {}}]
+    db_pod_spec["containers"][0].setdefault("env", []).append({"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"})
     return {
         "workload+service": [rich, _service_for(rich)],
         "service+db+configmap": [_service_for(db), db, config_map],
@@ -368,3 +369,41 @@ def test_rule_weights_favour_credentials_and_image_tags():
             first_picks[result.applied_rule_ids[0]] += 1
     others = [n for rule, n in first_picks.items() if rule not in ("KSEC-001", "KSEC-005")]
     assert first_picks["KSEC-001"] > max(others) and first_picks["KSEC-005"] > max(others)
+
+
+def _collapsing_db():
+    # KSEC-011's fix collapses BOTH satisfying entries into one, shortening
+    # env; PGDATA after them is something KSEC-012 fixes by index. Before the
+    # per-step round-trip check, KSEC-012 then KSEC-011 left KSEC-012's op
+    # pointing past the end of env ("can't replace outside of list").
+    doc = _db_deployment()
+    container = doc["spec"]["template"]["spec"]["containers"][0]
+    container["env"] = [
+        {"name": "POSTGRES_HOST_AUTH_METHOD", "value": "md5"},
+        {"name": "POSTGRES_PASSWORD_FILE", "value": "/run/secrets/pg"},
+        {"name": "TZ", "value": "UTC"},
+        {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
+    ]
+    return doc
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_compositions_that_shorten_a_list_still_round_trip(seed):
+    doc = _collapsing_db()
+    try:
+        result = mutate_multi_defect(copy.deepcopy(doc), random.Random(seed), min_defects=2, max_defects=8)
+    except AssertionError:
+        return
+    if result is None:
+        return
+    assert _apply_patch(result.mutated_doc, result.patch) == result.canonical
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_file_compositions_that_shorten_a_list_still_round_trip(seed):
+    db = _collapsing_db()
+    docs = [db, _service_for(db)]
+    result = mutate_multi_defect_file(copy.deepcopy(docs), random.Random(seed), 2, 8)
+    if result is None:
+        return
+    assert _apply_file_patch(result.mutated_docs, result.patch) == result.canonical_docs

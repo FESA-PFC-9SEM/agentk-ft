@@ -38,7 +38,7 @@ import yaml
 
 from dataset.detect import detect_file
 from dataset.schema import SYSTEM_PROMPT
-from finetune.evaluate import apply_multidoc_patch, parse_model_output
+from finetune.evaluate import apply_multidoc_patch, parse_model_output, patch_ops_for_finding
 
 CATEGORIES = ("Credenciais Expostas", "Imagem sem Tag", "Erro de Sintaxe/Config")
 
@@ -69,6 +69,24 @@ def _finding_matches_instance(finding: dict, instance: dict) -> bool:
     raise ValueError(f"unknown match_type: {match_type!r}")
 
 
+def _corrected_by_its_own_ops(instance: dict, docs: list[dict], findings: list[dict], patch: list[dict]) -> bool:
+    """Per-finding correction: apply ONLY the ops that belong to the model's
+    findings for this instance (patch_ops_for_finding, the same "apply just
+    this finding" logic the demo uses) and check the instance is gone. Unlike
+    the strict score, an unrelated bad op elsewhere in the patch can't cancel
+    a correct fix."""
+    ops = []
+    for finding in findings:
+        if _finding_matches_instance(finding, instance):
+            ops.extend(op for op in patch_ops_for_finding(finding, patch) if op not in ops)
+    if not ops:
+        return False
+    patched_docs, applied_ok = apply_multidoc_patch(docs, ops)
+    if not applied_ok:
+        return False
+    return not any(_finding_matches_instance(f.to_dict(), instance) for f in detect_file(patched_docs))
+
+
 def score_instance(instance: dict, findings: list[dict], patched_findings: list[dict] | None) -> dict:
     """Scores one ground-truth instance against one generation's findings
     (before the patch) and, if the patch applied, the findings remaining
@@ -93,7 +111,10 @@ def score_run(docs: list[dict], instances: list[dict], raw_output: str) -> dict:
         "schema_errors": "; ".join(errors),
         "patch_applies": None,
         "notes": "",
-        "instances": {inst["id"]: {"detected": False, "corrected": False, "applicable": False} for inst in instances},
+        "instances": {
+            inst["id"]: {"detected": False, "corrected": False, "corrected_per_finding": False, "applicable": False}
+            for inst in instances
+        },
         "raw_output": raw_output,
     }
     if response is None:
@@ -109,7 +130,11 @@ def score_run(docs: list[dict], instances: list[dict], raw_output: str) -> dict:
         patched_findings = [finding.to_dict() for finding in detect_file(patched_docs)]
 
     for instance in instances:
-        result["instances"][instance["id"]] = score_instance(instance, findings, patched_findings)
+        scored = score_instance(instance, findings, patched_findings)
+        scored["corrected_per_finding"] = scored["applicable"] and (
+            scored["corrected"] or _corrected_by_its_own_ops(instance, docs, findings, response.get("patch", []))
+        )
+        result["instances"][instance["id"]] = scored
 
     return result
 
@@ -125,8 +150,12 @@ def summarize_file(file_results: list[dict], instances: list[dict]) -> dict:
 
     detected_per_run = [sum(1 for v in r["instances"].values() if v["detected"]) for r in file_results]
     corrected_per_run = [sum(1 for v in r["instances"].values() if v["corrected"]) for r in file_results]
+    per_finding_per_run = [
+        sum(1 for v in r["instances"].values() if v.get("corrected_per_finding")) for r in file_results
+    ]
     avg_detected = sum(detected_per_run) / n_runs if n_runs else 0.0
     avg_corrected = sum(corrected_per_run) / n_runs if n_runs else 0.0
+    avg_per_finding = sum(per_finding_per_run) / n_runs if n_runs else 0.0
 
     by_category = collections.Counter(inst["category"] for inst in instances)
 
@@ -139,6 +168,9 @@ def summarize_file(file_results: list[dict], instances: list[dict]) -> dict:
         "avg_corrected": round(avg_corrected, 2),
         "avg_not_corrected": round(n_instances - avg_corrected, 2),
         "corrected_pct": round(avg_corrected / n_instances * 100, 1) if n_instances else None,
+        "avg_corrected_per_finding": round(avg_per_finding, 2),
+        "avg_not_corrected_per_finding": round(n_instances - avg_per_finding, 2),
+        "corrected_per_finding_pct": round(avg_per_finding / n_instances * 100, 1) if n_instances else None,
         "by_category": dict(by_category),
         "schema_valid_rate": f"{sum(1 for r in file_results if r['schema_valid'])}/{n_runs}",
     }
@@ -176,6 +208,16 @@ def write_excel(
 
     add_rate_sheet("Detecção", "avg_detected", "avg_not_detected", "detected_pct", "Detectado", "Não detectado")
     add_rate_sheet("Corrigido", "avg_corrected", "avg_not_corrected", "corrected_pct", "Corrigido", "Não corrigido")
+    # Same, but each finding's ops applied on their own (see _corrected_by_its_own_ops):
+    # one invalid op elsewhere in the patch no longer cancels a correct fix.
+    add_rate_sheet(
+        "Corrigido (por achado)",
+        "avg_corrected_per_finding",
+        "avg_not_corrected_per_finding",
+        "corrected_per_finding_pct",
+        "Corrigido",
+        "Não corrigido",
+    )
 
     cat_ws = wb.create_sheet("Categorias")
     cat_ws.append(["Arquivo", *CATEGORIES, "Total", "schema_valid_rate"])
@@ -209,10 +251,13 @@ def write_excel(
         gt_ws.column_dimensions[get_column_letter(i)].width = width
 
     runs_ws = wb.create_sheet("Runs")
-    runs_ws.append(["file", "run", "schema_valid", "patch_applies", "detected", "corrected", "notes", "schema_errors", "raw_output"])
+    runs_ws.append(
+        ["file", "run", "schema_valid", "patch_applies", "detected", "corrected", "corrected_per_finding", "notes", "schema_errors", "raw_output"]
+    )
     for row in rows:
         detected_ids = [str(i) for i, v in row["instances"].items() if v["detected"]]
         corrected_ids = [str(i) for i, v in row["instances"].items() if v["corrected"]]
+        per_finding_ids = [str(i) for i, v in row["instances"].items() if v.get("corrected_per_finding")]
         runs_ws.append(
             [
                 row["file"],
@@ -221,12 +266,13 @@ def write_excel(
                 row["patch_applies"],
                 ", ".join(detected_ids),
                 ", ".join(corrected_ids),
+                ", ".join(per_finding_ids),
                 row["notes"],
                 row["schema_errors"],
                 row["raw_output"],
             ]
         )
-    for i, width in enumerate([22, 5, 10, 12, 20, 20, 30, 30, 60], start=1):
+    for i, width in enumerate([22, 5, 10, 12, 20, 20, 20, 30, 30, 60], start=1):
         runs_ws.column_dimensions[get_column_letter(i)].width = width
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,8 +306,8 @@ def run(args: argparse.Namespace) -> None:
                 SYSTEM_PROMPT,
                 raw_text,
                 args.max_new_tokens,
-                do_sample=True,
-                temperature=args.temperature,
+                do_sample=args.temperature > 0,
+                temperature=args.temperature if args.temperature > 0 else None,
             )
             result = score_run(docs, instances, output_text)
             file_results.append(result)
@@ -287,7 +333,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--test-cases", default="scenarios/test_cases.yaml")
     parser.add_argument("--output", default="finetune/output/scenarios_results.xlsx")
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="sampling temperature; 0 = greedy decoding (deterministic -- use with --runs 1)",
+    )
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=1280)
     return parser.parse_args(argv)
