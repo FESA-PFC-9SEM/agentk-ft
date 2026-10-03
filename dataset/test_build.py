@@ -380,8 +380,10 @@ def test_find_sibling_bundles_pairs_a_service_with_the_one_workload_it_selects()
         bundles = find_sibling_bundles(records, random.Random(seed))
         assert len(bundles) == 1
         kinds = [d["kind"] for d in bundles[0].docs]
-        assert sorted(k for k in kinds if k != "ConfigMap") == ["Deployment", "Service"]
-        assert bundles[0].docs[kinds.index("Deployment")]["metadata"]["name"] == "web"
+        workload_kind = next(k for k in kinds if k not in ("ConfigMap", "Service"))
+        assert workload_kind in ("Deployment", "ReplicationController")
+        assert sorted(k for k in kinds if k != "ConfigMap") == sorted([workload_kind, "Service"])
+        assert bundles[0].docs[kinds.index(workload_kind)]["metadata"]["name"] == "web"
         assert bundles[0].repo == "repoA"
 
 
@@ -465,3 +467,21 @@ def test_build_without_multi_doc_ratio_emits_single_documents_only(tmp_path):
     diagnostic = build(args)
     assert "usable_bundles" not in diagnostic
     assert all("\n---\n" not in e["messages"][1]["content"] for e in _read_examples(tmp_path / "output"))
+
+
+def test_as_replication_controller_keeps_the_pods_and_flattens_the_selector():
+    from dataset.build import as_replication_controller
+    from dataset.detect import detect_all
+
+    deployment = _workload("web", "web")
+    deployment["spec"]["strategy"] = {"type": "RollingUpdate"}
+    rc = as_replication_controller(deployment)
+    assert rc["kind"] == "ReplicationController" and rc["apiVersion"] == "v1"
+    assert rc["spec"]["selector"] == {"app": "web"}
+    assert "strategy" not in rc["spec"]
+    assert rc["spec"]["template"] == deployment["spec"]["template"]
+    assert detect_all(rc) == []
+    expressions = _workload("db", "db")
+    expressions["spec"]["selector"]["matchExpressions"] = [{"key": "app", "operator": "Exists"}]
+    assert as_replication_controller(expressions) is None
+    assert as_replication_controller(_service("web")) is None

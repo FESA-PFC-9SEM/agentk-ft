@@ -13,11 +13,10 @@ runs/
 # train.jsonl is ~130MB). Compressed .jsonl.gz versions are committed
 # instead -- see scripts/compress_dataset.sh and scripts/decompress_dataset.sh.
 # dataset/output-multi-defect/ is the multi-defect strategy's parallel output
-# (see README.md's "Dataset generation strategies" section) -- same treatment.
-dataset/output/*.jsonl
-dataset/output/unsloth/*.jsonl
-dataset/output-multi-defect/*.jsonl
-dataset/output-multi-defect/unsloth/*.jsonl
+# (see README.md's "Dataset generation strategies" section), and versioned
+# rebuilds (dataset/output-multi-defect-v2, ...) get the same treatment.
+dataset/output*/*.jsonl
+dataset/output*/unsloth/*.jsonl
 generation/output/*.jsonl
 
 # kubectl-query task (query_training/): generated splits + auto-named training

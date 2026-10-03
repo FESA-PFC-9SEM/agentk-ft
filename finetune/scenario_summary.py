@@ -30,7 +30,10 @@ import yaml
 
 from finetune import run_scenarios
 from finetune.evaluate import strip_fences
-from finetune.run_scenarios import load_test_cases, score_run
+from dataset.detect import detect_file
+from dataset.schema import RULE_IDS
+from finetune.metrics import paths_related, prf, rule_confusions
+from finetune.run_scenarios import _finding_matches_instance, load_test_cases, score_run
 
 HEADER = [
     "model",
@@ -97,6 +100,66 @@ def score_file(results_path: Path, cases: dict, lenient: bool) -> dict[str, dict
         return totals
     finally:
         run_scenarios.parse_model_output = strict_parser
+
+
+def classification_metrics(results_path: Path, cases: dict, lenient: bool) -> dict:
+    """Precision/recall/F1 (finding level) and accuracy/precision/recall/F1
+    (scenario x rule level) for one result file, pooled over all runs.
+
+    Finding level: a model finding is correct if it matches a ground-truth
+    error, or a real defect the ground truth doesn't list (confirmed by the
+    project's detectors -- e.g. KSEC-003 on 8-newrelic's host agent); any
+    other finding is a false positive. Recall is reported over the in-scope
+    errors and over all errors (out-of-scope ones counted as misses).
+
+    Scenario x rule: for each scenario run and each rule, "does this file
+    have a KSEC-00X problem?" -- truth from the ground truth plus the
+    detectors, prediction from the model's findings."""
+    from openpyxl import load_workbook
+
+    rows = list(load_workbook(results_path, read_only=True)["Runs"].iter_rows(values_only=True))
+    header = rows[0]
+    parse = lenient_parse if lenient else run_scenarios.parse_model_output
+    correct = wrong = 0
+    gt_hit_scope = gt_scope = gt_hit_all = gt_all = 0
+    pairs = []
+    for values in rows[1:]:
+        row = dict(zip(header, values))
+        name = row["file"]
+        if name not in cases:
+            continue
+        docs = list(yaml.safe_load_all((Path("scenarios") / name).read_text(encoding="utf-8")))
+        response, _ = parse(row["raw_output"] or "")
+        findings = response.get("findings", []) if response else []
+        real = [f.to_dict() for f in detect_file(docs)]
+        instances = cases[name]
+        for finding in findings:
+            if any(i["rule_id"] and _finding_matches_instance(finding, i) for i in instances) or any(
+                r["rule_id"] == finding.get("rule_id")
+                and r["doc"] == finding.get("doc", 0)
+                and paths_related(r["path"], str(finding.get("path", "")))
+                for r in real
+            ):
+                correct += 1
+            else:
+                wrong += 1
+        for inst in instances:
+            hit = inst["rule_id"] is not None and any(_finding_matches_instance(f, inst) for f in findings)
+            gt_all += 1
+            gt_hit_all += hit
+            if inst["rule_id"] is not None:
+                gt_scope += 1
+                gt_hit_scope += hit
+        actual = {i["rule_id"] for i in instances if i["rule_id"]} | {r["rule_id"] for r in real}
+        pairs.append((actual, {f.get("rule_id") for f in findings}))
+    precision = round(correct / (correct + wrong), 4) if correct + wrong else None
+    out = {"findings_reported": correct + wrong, "correct_findings": correct, "false_positives": wrong, "precision": precision}
+    for label, hit, total in (("in scope", gt_hit_scope, gt_scope), ("all errors", gt_hit_all, gt_all)):
+        recall = round(hit / total, 4) if total else None
+        f1 = round(2 * precision * recall / (precision + recall), 4) if precision and recall else 0.0
+        out[label] = {"errors": total, "detected": hit, "recall": recall, "f1": f1}
+    out["rule_level"] = rule_confusions(pairs, sorted(RULE_IDS))
+    return out
 
 
 def build_workbook(run_dir: Path, lenient: bool, test_cases: Path = Path("scenarios/test_cases.yaml")):
@@ -167,6 +230,42 @@ def build_workbook(run_dir: Path, lenient: bool, test_cases: Path = Path("scenar
                 )
                 lines.append(f"{title:34} detected {100 * det_all / n_all:5.1f}%   corrected {100 * cor_all / n_all:5.1f}%")
     style(summary, (48, 34, 10, 12, 12, 12, 12, 11, 11))
+
+    metrics_ws = wb.create_sheet("Metrics")
+    metrics_ws.append(
+        ["model", "setting", "level", "TP", "FP", "FN", "TN", "precision", "recall", "F1", "accuracy"]
+    )
+    rules_ws = wb.create_sheet("Metrics per rule")
+    rules_ws.append(["model", "setting", "rule", "TP", "FP", "FN", "TN", "precision", "recall", "F1", "accuracy"])
+    for decoding, (file_name, _) in RESULT_FILES.items():
+        path = run_dir / file_name
+        if not path.exists():
+            continue
+        for use_lenient in parsings:
+            setting = decoding + (" (lenient)" if use_lenient else "")
+            m = classification_metrics(path, cases, use_lenient)
+            for label in ("in scope", "all errors"):
+                g = m[label]
+                metrics_ws.append(
+                    [model, setting, f"finding ({label})", g["detected"], m["false_positives"], g["errors"] - g["detected"],
+                     None, m["precision"], g["recall"], g["f1"], None]
+                )
+            for label, c in (("scenario x rule (micro)", m["rule_level"]["micro"]),):
+                metrics_ws.append([model, setting, label, c["tp"], c["fp"], c["fn"], c["tn"], c["precision"], c["recall"], c["f1"], c["accuracy"]])
+            mac = m["rule_level"]["macro"]
+            metrics_ws.append([model, setting, "scenario x rule (macro)", None, None, None, None, mac["precision"], mac["recall"], mac["f1"], mac["accuracy"]])
+            for rule, c in m["rule_level"]["per_rule"].items():
+                rules_ws.append([model, setting, rule, c["tp"], c["fp"], c["fn"], c["tn"], c["precision"], c["recall"], c["f1"], c["accuracy"]])
+            lines.append(
+                f"{setting:20} findings: P={m['precision']} R(in scope)={m['in scope']['recall']} "
+                f"F1={m['in scope']['f1']} | R(all)={m['all errors']['recall']} F1={m['all errors']['f1']} | "
+                f"rule micro acc={m['rule_level']['micro']['accuracy']} F1={m['rule_level']['micro']['f1']}"
+            )
+    metrics_ws.append([])
+    metrics_ws.append(["finding level: a finding is correct if it matches a ground-truth error or a real defect confirmed by the detectors; no TN exists, so no accuracy."])
+    metrics_ws.append(["scenario x rule: one yes/no question per scenario run and rule (does this file have a KSEC-00X problem?); micro = pooled counts, macro = mean over rules."])
+    style(metrics_ws, (48, 16, 28, 7, 7, 7, 7, 10, 10, 10, 10))
+    style(rules_ws, (48, 16, 10, 7, 7, 7, 7, 10, 10, 10, 10))
     return wb, lines
 
 

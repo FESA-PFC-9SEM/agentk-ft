@@ -240,3 +240,22 @@ def test_per_finding_correction_needs_a_matching_finding():
     result = score_run(docs, [instance], json.dumps(output))
     # The strict score still credits a fix without a finding; per-finding follows it.
     assert result["instances"][1]["corrected"] == result["instances"][1]["corrected_per_finding"]
+
+
+def test_ground_truth_matches_the_scenario_files():
+    # Every listed error must be one the detectors actually find in ITS file
+    # -- catches a test_cases.yaml edit that attaches errors to the wrong
+    # file or names a rule that doesn't apply.
+    from pathlib import Path
+
+    import yaml
+
+    from dataset.detect import detect_file
+    from finetune.run_scenarios import _finding_matches_instance, load_test_cases
+
+    cases = load_test_cases(Path("scenarios/test_cases.yaml"))
+    for name, instances in cases.items():
+        findings = [f.to_dict() for f in detect_file(list(yaml.safe_load_all(Path("scenarios", name).read_text())))]
+        for inst in instances:
+            assert inst["rule_id"] is not None, (name, inst["id"])
+            assert any(_finding_matches_instance(f, inst) for f in findings), (name, inst["id"])

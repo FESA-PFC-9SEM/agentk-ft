@@ -411,31 +411,77 @@ def _mutate_ksec001_env(
         "name": var_name,
         "valueFrom": {"secretKeyRef": {"name": secret_resource_name, "key": secret_key}},
     }
+    # Sometimes preceded by its plaintext username (DB_USER: admin before
+    # DB_PASSWORD) -- not a finding, present in the target too. Without
+    # this, a model trained on v5 skipped every credential that came after a
+    # username (scenarios/10-mongodb.yaml, 3-mysql.yaml), a pairing real
+    # manifests almost always have but the training data never showed.
+    companion = _companion_username(var_name, existing_names | blocked, rng)
+    new_entries = [companion, hardened_entry] if companion else [hardened_entry]
+
+    # Inserted at a random position rather than always appended, but never
+    # before an env index an existing finding points at (an earlier step of
+    # a multi-defect composition), which would shift it out from under that
+    # step's own patch.
+    orig_env = orig_container.get("env") if isinstance(orig_container.get("env"), list) else []
+    env_prefix = f"{cpath}/env/"
+    taken = [
+        int(f.path[len(env_prefix):].split("/")[0])
+        for f in detect_all(canonical_doc, doc_index)
+        if f.path.startswith(env_prefix) and f.path[len(env_prefix):].split("/")[0].isdigit()
+    ]
+    lowest = min(max(taken) + 1 if taken else 0, len(orig_env))
+    insert_at = rng.randint(lowest, len(orig_env))
+    env_index = insert_at + len(new_entries) - 1
+
     canonical_with_ref = copy.deepcopy(canonical_doc)
     c_pod_spec, _ = get_pod_spec(canonical_with_ref)
     c_containers = list(iter_containers(c_pod_spec, prefix))
     _, c_container = c_containers[container_idx]
-    c_env = c_container.setdefault("env", [])
-    env_index = len(c_env)
-    c_env.append(hardened_entry)
+    c_container.setdefault("env", [])[insert_at:insert_at] = copy.deepcopy(new_entries)
 
     mutated_doc = copy.deepcopy(canonical_doc)
     m_pod_spec, _ = get_pod_spec(mutated_doc)
     m_containers = list(iter_containers(m_pod_spec, prefix))
     _, m_container = m_containers[container_idx]
-    m_env = m_container.setdefault("env", [])
-    assert len(m_env) == env_index
-    m_env.append({"name": var_name, "value": _fake_secret_value(rng)})
+    plaintext = {"name": var_name, "value": _fake_secret_value(rng)}
+    m_container.setdefault("env", [])[insert_at:insert_at] = copy.deepcopy(new_entries[:-1]) + [plaintext]
 
     env_path = f"{cpath}/env/{env_index}"
     patch = [PatchOp(doc_index, "replace", env_path, hardened_entry)]
 
-    findings = detect_ksec001(mutated_doc, doc_index)
-    assert findings, "KSEC-001 env mutation produced no finding"
+    existing = detect_ksec001(canonical_doc, doc_index)
+    findings = [f for f in detect_ksec001(mutated_doc, doc_index) if f not in existing]
+    if len(findings) != 1:
+        return None
 
     new_resources = [_placeholder_secret_yaml(canonical_doc, secret_resource_name, secret_key)]
 
     return MutationResult(mutated_doc, canonical_with_ref, findings, patch, new_resources)
+
+
+_PASSWORD_SUFFIX_RE = re.compile(r"^(?P<stem>.*?)(?P<sep>[_-]?)(?P<word>password|passwd|pwd|pass)$", re.IGNORECASE)
+_USERNAME_VALUES = ("admin", "root", "app", "user", "service", "postgres", "mongo")
+_COMPANION_USERNAME_PROBABILITY = 0.5
+
+
+def _companion_username(var_name: str, taken: set, rng: random.Random) -> dict | None:
+    """The username variable that usually accompanies a password variable
+    (DB_PASSWORD -> DB_USER / DB_USERNAME, mysqlPass -> mysqlUser), or None
+    (half the time, for names without a password-like suffix, or if that
+    name is already in use)."""
+    m = _PASSWORD_SUFFIX_RE.match(var_name)
+    if not m or not m["stem"] or rng.random() >= _COMPANION_USERNAME_PROBABILITY:
+        return None
+    word = rng.choice(("user", "username"))
+    if m["word"].isupper():
+        word = word.upper()
+    elif m["word"][:1].isupper():
+        word = word.capitalize()
+    name = f"{m['stem']}{m['sep']}{word}"
+    if name in taken or _is_credential_name(name):
+        return None
+    return {"name": name, "value": rng.choice(_USERNAME_VALUES)}
 
 
 def _placeholder_secret_yaml(doc: dict, secret_name: str, key: str) -> str:

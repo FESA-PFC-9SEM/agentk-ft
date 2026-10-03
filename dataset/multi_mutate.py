@@ -34,6 +34,16 @@ from dataset.schema import Finding, PatchOp, RULE_IDS
 # once their target area is already dirty) naturally caps how many times a
 # repeat can actually succeed on a given document.
 MAX_REPEATS_PER_RULE = 2
+# Plaintext credentials come in clusters in real manifests (scenarios/
+# 1-orion.yaml has three in one container: DB_PASSWORD, API_KEY and a
+# -dbpwd flag), and a model that never saw more than two reported two and
+# stopped. KSEC-001 may therefore repeat more often than other rules.
+RULE_MAX_REPEATS = {"KSEC-001": 4}
+
+
+def _repeated(steps: list[str]) -> list[str]:
+    """Each step once per allowed repeat (RULE_MAX_REPEATS, else MAX_REPEATS_PER_RULE)."""
+    return [step for step in steps for _ in range(RULE_MAX_REPEATS.get(step, MAX_REPEATS_PER_RULE))]
 
 # Relative weight of each rule when choosing which defects to inject (rules
 # not listed weigh 1). With 11 rules sharing the budget uniformly, plaintext
@@ -113,9 +123,9 @@ def mutate_multi_defect(
     if existing:
         return None
 
-    max_possible = len(MUTATORS) * MAX_REPEATS_PER_RULE
-    target_count = _sample_defect_count(rng, min_defects, min(max_defects, max_possible))
-    rule_pool = _weighted_order(list(MUTATORS) * MAX_REPEATS_PER_RULE, rng, RULE_WEIGHTS)
+    rule_pool = _repeated(list(MUTATORS))
+    target_count = _sample_defect_count(rng, min_defects, min(max_defects, len(rule_pool)))
+    rule_pool = _weighted_order(rule_pool, rng, RULE_WEIGHTS)
 
     current_doc = canonical_doc
     running_canonical = copy.deepcopy(canonical_doc)
@@ -282,7 +292,7 @@ def mutate_multi_defect_file(
     if _file_rule_counts(docs):
         return None
 
-    steps = (list(MUTATORS) + [SERVICE_SELECTOR_STEP]) * MAX_REPEATS_PER_RULE
+    steps = _repeated(list(MUTATORS) + [SERVICE_SELECTOR_STEP])
     target_count = _sample_defect_count(rng, min_defects, min(max_defects, len(steps)))
     steps = _weighted_order(steps, rng, RULE_WEIGHTS)
 

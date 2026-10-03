@@ -201,6 +201,31 @@ def make_example(doc_for_input: dict | list, response: Response, repo: str, rule
 _EXTRA_SIBLING_PROBABILITY = 0.3
 
 
+# Share of Deployment bundles re-expressed as a ReplicationController. The
+# corpus has few Service + RC pairs (154 in the v5 data), and a model trained
+# on them attributed a Service selector mismatch to the RC with an invented
+# path (scenarios/5-nginx.yaml). Same pods, legacy kind, so labels stay real.
+_AS_REPLICATION_CONTROLLER_PROBABILITY = 0.2
+_DEPLOYMENT_ONLY_SPEC_FIELDS = ("strategy", "revisionHistoryLimit", "progressDeadlineSeconds", "paused")
+
+
+def as_replication_controller(doc: dict) -> dict | None:
+    """The same Deployment as a ReplicationController (apiVersion v1, a flat
+    label-map selector, no rollout fields), or None if it can't be expressed
+    as one -- not a Deployment, or a selector using matchExpressions."""
+    if doc.get("kind") != "Deployment" or not isinstance(doc.get("spec"), dict):
+        return None
+    selector = doc["spec"].get("selector")
+    if not isinstance(selector, dict) or set(selector) != {"matchLabels"} or not isinstance(selector["matchLabels"], dict):
+        return None
+    rc = json.loads(json.dumps(doc))
+    rc["apiVersion"], rc["kind"] = "v1", "ReplicationController"
+    rc["spec"]["selector"] = dict(selector["matchLabels"])
+    for key in _DEPLOYMENT_ONLY_SPEC_FIELDS:
+        rc["spec"].pop(key, None)
+    return rc
+
+
 def find_sibling_bundles(records: list[Record], rng: random.Random) -> list[Bundle]:
     """Multi-document files assembled from the corpus, which stores one
     document per row (real multi-document files are split upstream). A
@@ -230,7 +255,10 @@ def find_sibling_bundles(records: list[Record], rng: random.Random) -> list[Bund
             selected = [doc for doc, labels in workloads if label_selector_matches(selector, labels)]
             if len(selected) != 1:
                 continue
-            docs = [selected[0], r.doc]
+            workload = selected[0]
+            if rng.random() < _AS_REPLICATION_CONTROLLER_PROBABILITY:
+                workload = as_replication_controller(workload) or workload
+            docs = [workload, r.doc]
             rng.shuffle(docs)
             if extras and rng.random() < _EXTRA_SIBLING_PROBABILITY:
                 docs.insert(rng.randrange(len(docs) + 1), rng.choice(extras))

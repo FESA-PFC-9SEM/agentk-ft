@@ -237,3 +237,14 @@ def test_evaluate_example_applies_patches_per_document():
     wrong_doc = dict(expected, patch=[{"doc": 1, "op": "replace", "path": "/spec/selector/app", "value": "web"}])
     result = evaluate_example(docs, expected, json.dumps(wrong_doc))
     assert result["patch_applies"] is False
+
+
+def test_parse_model_output_enforces_the_evidence_mask():
+    finding = {"rule_id": "KSEC-001", "severity": "critical", "doc": 0, "path": "/x", "message": "m", "evidence": "sk-12***"}
+    response, errors = parse_model_output(json.dumps(dict(CLEAN_RESPONSE, findings=[finding])))
+    assert errors == []
+    assert response["findings"][0]["evidence"] == "sk-1***"
+    # A model that leaks the whole value never reaches the output unmasked.
+    finding["evidence"] = "hunter2hunter2"
+    response, _ = parse_model_output(json.dumps(dict(CLEAN_RESPONSE, findings=[finding])))
+    assert response["findings"][0]["evidence"] == "hunt***"

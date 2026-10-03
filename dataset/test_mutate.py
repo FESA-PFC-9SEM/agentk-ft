@@ -845,7 +845,33 @@ def test_ksec001_env_never_injects_a_var_that_satisfies_ksec011():
     names = ["POSTGRES_PASSWORD", "POSTGRES_HOST_AUTH_METHOD", "DB_PASSWORD"]
     for seed in range(30):
         result = _mutate_ksec001_env(doc, random.Random(seed), 0, candidate_names=names)
-        assert _env_of(result.mutated_doc)[-1]["name"] == "DB_PASSWORD"
+        plaintext = [e["name"] for e in _env_of(result.mutated_doc) if "value" in e and e["name"].endswith("PASSWORD")]
+        assert plaintext == ["DB_PASSWORD"]
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_ksec001_env_inserts_at_random_positions_with_an_optional_username(seed):
+    env = [{"name": "TZ", "value": "UTC"}, {"name": "LOG_LEVEL", "value": "info"}]
+    doc = _deployment({"env": env})
+    result = _mutate_ksec001_env(doc, random.Random(seed), 0, candidate_names=["DB_PASSWORD"])
+    _assert_round_trip(result)
+    assert len(result.findings) == 1
+    names = [e["name"] for e in _env_of(result.mutated_doc)]
+    assert [n for n in names if n in ("TZ", "LOG_LEVEL")] == ["TZ", "LOG_LEVEL"]
+    if "DB_USER" in names or "DB_USERNAME" in names:
+        user = names.index("DB_USER") if "DB_USER" in names else names.index("DB_USERNAME")
+        assert names[user + 1] == "DB_PASSWORD"  # username right before its password
+        assert _env_of(result.canonical)[user] == _env_of(result.mutated_doc)[user]  # kept in the target
+
+
+def test_ksec001_env_username_appears_and_position_varies():
+    seen_user, positions = False, set()
+    for seed in range(60):
+        doc = _deployment({"env": [{"name": "TZ", "value": "UTC"}, {"name": "LOG_LEVEL", "value": "info"}]})
+        names = [e["name"] for e in _env_of(_mutate_ksec001_env(doc, random.Random(seed), 0, candidate_names=["DB_PASSWORD"]).mutated_doc)]
+        seen_user |= any(n.startswith("DB_USER") for n in names)
+        positions.add(names.index("DB_PASSWORD"))
+    assert seen_user and len(positions) > 1
 
 
 def test_ksec001_env_leaves_a_container_with_pending_ksec011_alone():

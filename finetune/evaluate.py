@@ -35,7 +35,8 @@ from pathlib import Path
 import jsonpatch
 import yaml
 
-from dataset.schema import RULE_IDS, validate_response
+from dataset.schema import RULE_IDS, mask_evidence, validate_response
+from finetune.metrics import confusion, paths_related, prf, rule_confusions
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?|\n?```\s*$", re.MULTILINE)
 
@@ -53,8 +54,26 @@ def parse_model_output(raw_text: str) -> tuple[dict | None, list[str]]:
         obj = json.loads(cleaned)
     except json.JSONDecodeError as e:
         return None, [f"invalid JSON: {e}"]
+    enforce_evidence_mask(obj)
     errors = validate_response(obj)
     return (obj if not errors else None), errors
+
+
+def enforce_evidence_mask(obj) -> None:
+    """Re-masks every finding's evidence to its first 4 characters + "***",
+    in place. Masking is a mechanical safety rule (a secret must never be
+    shown in full), so it's enforced in code instead of trusted to the model:
+    the v5 adapter got the rule right but miscounted characters on 12 of 50
+    sampled scenario answers ("sk-12***", "mypass***"), and one such field
+    invalidated an otherwise fully correct response."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("findings"), list):
+        return
+    for finding in obj["findings"]:
+        if isinstance(finding, dict) and isinstance(finding.get("evidence"), str) and finding["evidence"]:
+            value = finding["evidence"]
+            if value.endswith("***"):
+                value = value[:-3]
+            finding["evidence"] = mask_evidence(value) if value else finding["evidence"]
 
 
 def parse_manifest(text: str) -> list:
@@ -102,6 +121,39 @@ def patch_ops_for_finding(finding: dict, patch_ops: list[dict]) -> list[dict]:
     ]
 
 
+def match_findings(expected: list[dict], predicted: list[dict]) -> dict:
+    """Finding-level matching: each predicted finding pairs with at most one
+    expected finding of the same rule, in the same document, at the same
+    JSON Pointer or a parent/child of it. Returns overall and per-rule
+    TP/FP/FN counts."""
+    unmatched = list(expected)
+    by_rule: dict[str, list[int]] = {}
+    tp = fp = 0
+    for finding in predicted:
+        rule = finding.get("rule_id")
+        hit = next(
+            (
+                e
+                for e in unmatched
+                if e.get("rule_id") == rule
+                and e.get("doc", 0) == finding.get("doc", 0)
+                and paths_related(str(e.get("path", "")), str(finding.get("path", "")))
+            ),
+            None,
+        )
+        counts = by_rule.setdefault(rule, [0, 0, 0])
+        if hit is not None:
+            unmatched.remove(hit)
+            tp += 1
+            counts[0] += 1
+        else:
+            fp += 1
+            counts[1] += 1
+    for e in unmatched:
+        by_rule.setdefault(e.get("rule_id"), [0, 0, 0])[2] += 1
+    return {"finding_tp": tp, "finding_fp": fp, "finding_fn": len(unmatched), "finding_counts_by_rule": by_rule}
+
+
 def evaluate_example(input_docs: dict | list, expected_response: dict, model_output_text: str) -> dict:
     """Pure scoring for one example -- no model/network involved. Compares
     the model's parsed response against this example's ground truth.
@@ -116,6 +168,8 @@ def evaluate_example(input_docs: dict | list, expected_response: dict, model_out
         "schema_errors": schema_errors,
         "expected_rules": sorted(expected_rules),
         "predicted_rules": [],
+        # An invalid response reports nothing: every expected finding is missed.
+        **match_findings(expected_response.get("findings", []), []),
         "patch_applies": False,
         "patch_correct": False,
         "new_resources_presence_correct": False,
@@ -125,6 +179,7 @@ def evaluate_example(input_docs: dict | list, expected_response: dict, model_out
 
     predicted_rules = {f["rule_id"] for f in model_response.get("findings", [])}
     result["predicted_rules"] = sorted(predicted_rules)
+    result.update(match_findings(expected_response.get("findings", []), model_response.get("findings", [])))
 
     expected_result, _ = apply_multidoc_patch(docs, expected_response.get("patch", []))
     model_result, applied_ok = apply_multidoc_patch(docs, model_response.get("patch", []))
@@ -139,33 +194,6 @@ def evaluate_example(input_docs: dict | list, expected_response: dict, model_out
     return result
 
 
-def _rule_confusion(results: list[dict], rule_id: str) -> dict:
-    tp = fp = fn = tn = 0
-    for r in results:
-        expected = rule_id in r["expected_rules"]
-        predicted = r["schema_valid"] and rule_id in r["predicted_rules"]
-        if expected and predicted:
-            tp += 1
-        elif predicted and not expected:
-            fp += 1
-        elif expected and not predicted:
-            fn += 1
-        else:
-            tn += 1
-    precision = tp / (tp + fp) if (tp + fp) else None
-    recall = tp / (tp + fn) if (tp + fn) else None
-    f1 = (2 * precision * recall / (precision + recall)) if precision and recall else None
-    return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "tn": tn,
-        "precision": round(precision, 4) if precision is not None else None,
-        "recall": round(recall, 4) if recall is not None else None,
-        "f1": round(f1, 4) if f1 is not None else None,
-    }
-
-
 def aggregate_results(results: list[dict]) -> dict:
     total = len(results)
     if total == 0:
@@ -177,7 +205,40 @@ def aggregate_results(results: list[dict]) -> dict:
     patch_correct = sum(1 for r in schema_valid_results if r["patch_correct"])
     new_resources_correct = sum(1 for r in schema_valid_results if r["new_resources_presence_correct"])
 
-    per_rule = {rule_id: _rule_confusion(results, rule_id) for rule_id in sorted(RULE_IDS)}
+    # Example x rule: "does this example have a KSEC-00X problem?" -- an
+    # invalid response predicts nothing.
+    rule_level = rule_confusions(
+        ((set(r["expected_rules"]), set(r["predicted_rules"]) if r["schema_valid"] else set()) for r in results),
+        sorted(RULE_IDS),
+    )
+
+    # Finding level: precision/recall/F1 of the individual findings.
+    finding_by_rule: dict[str, list[int]] = {}
+    for r in results:
+        for rule, counts in r.get("finding_counts_by_rule", {}).items():
+            acc = finding_by_rule.setdefault(rule, [0, 0, 0])
+            for i in range(3):
+                acc[i] += counts[i]
+    findings = {
+        "overall": prf(
+            sum(r.get("finding_tp", 0) for r in results),
+            sum(r.get("finding_fp", 0) for r in results),
+            sum(r.get("finding_fn", 0) for r in results),
+        ),
+        "per_rule": {rule: prf(*finding_by_rule[rule]) for rule in sorted(finding_by_rule)},
+        "exact_finding_set_rate": round(
+            sum(1 for r in results if r.get("finding_fp", 0) == 0 and r.get("finding_fn", 0) == 0) / total, 4
+        ),
+    }
+
+    # Clean vs dirty: "does this example have any problem at all?"
+    tp = fp = fn = tn = 0
+    for r in results:
+        actual, predicted = bool(r["expected_rules"]), bool(r["schema_valid"] and r["predicted_rules"])
+        tp += actual and predicted
+        fp += predicted and not actual
+        fn += actual and not predicted
+        tn += not actual and not predicted
 
     clean_examples = [r for r in results if not r["expected_rules"]]
     clean_correct = sum(1 for r in clean_examples if r["schema_valid"] and not r["predicted_rules"])
@@ -194,7 +255,11 @@ def aggregate_results(results: list[dict]) -> dict:
         "clean_correctly_identified_rate": (
             round(clean_correct / len(clean_examples), 4) if clean_examples else None
         ),
-        "per_rule": per_rule,
+        "clean_vs_dirty": confusion(tp, fp, fn, tn),
+        "findings": findings,
+        "per_rule": rule_level["per_rule"],
+        "per_rule_micro": rule_level["micro"],
+        "per_rule_macro": rule_level["macro"],
     }
 
 
