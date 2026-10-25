@@ -55,3 +55,4 @@ def paths_related(a: str, b: str) -> bool:
     """Same JSON Pointer, or one an ancestor of the other: models (and fixes)
     often point at `.../env/1` for a problem detected at `.../env/1/value`."""
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
