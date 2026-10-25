@@ -176,6 +176,30 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+def sequence_length_kwargs(max_seq_length: int) -> dict:
+    """The SFTConfig field(s) for the maximum sequence length, under the
+    name(s) this TRL version supports (max_length in newer releases,
+    max_seq_length in older ones)."""
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(SFTConfig)}
+    return {name: max_seq_length for name in ("max_length", "max_seq_length") if name in fields}
+
+
+def check_no_examples_dropped(rows_in_file: int, rows_to_train: int, tolerance: float = 0.01) -> None:
+    """Stops training if the trainer is about to use noticeably fewer
+    examples than the file has. export_for_unsloth.py already dropped every
+    example that doesn't fit, so any loss here means truncation is cutting
+    answers off (see sequence_length_kwargs)."""
+    if rows_to_train < rows_in_file * (1 - tolerance):
+        raise SystemExit(
+            f"Refusing to train: only {rows_to_train} of {rows_in_file} examples survived tokenization "
+            f"({100 * rows_to_train / rows_in_file:.1f}%). The sequence length is probably not being applied "
+            f"(check the installed TRL/Unsloth versions against sequence_length_kwargs)."
+        )
+    print(f"Training on {rows_to_train} of {rows_in_file} examples.")
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
 
@@ -234,6 +258,13 @@ def main(argv=None) -> None:
         packing=False,
         callbacks=[metrics_logger],
         args=SFTConfig(
+            # The sequence length must be set on the config: newer TRL
+            # ignores SFTTrainer's max_seq_length keyword and falls back to
+            # max_length=1024 -- with an ~800-token system prompt that cut
+            # off the answer of 90% of the examples, which
+            # train_on_responses_only then silently dropped (3B/1.5B runs of
+            # 2026-10-25 trained on 1,121 of 11,894 examples).
+            **sequence_length_kwargs(args.max_seq_length),
             max_steps=args.max_steps,
             output_dir=args.output_dir,
             logging_steps=args.logging_steps,
@@ -276,6 +307,8 @@ def main(argv=None) -> None:
         instruction_part="<|im_start|>user\n",
         response_part="<|im_start|>assistant\n",
     )
+
+    check_no_examples_dropped(len(train_dataset), len(trainer.train_dataset))
 
     trainer.train(resume_from_checkpoint=args.resume)
 

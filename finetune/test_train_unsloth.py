@@ -109,3 +109,25 @@ def test_invalid_preset_rejected():
 def test_all_preset_dicts_share_the_same_keys():
     key_sets = [set(preset.keys()) for preset in PRESETS.values()]
     assert all(keys == key_sets[0] for keys in key_sets)
+
+
+def test_sequence_length_reaches_the_config_under_a_supported_name():
+    from trl import SFTConfig
+
+    from finetune.train_unsloth import sequence_length_kwargs
+
+    kwargs = sequence_length_kwargs(4096)
+    assert kwargs and set(kwargs.values()) == {4096}
+    config = SFTConfig(output_dir="/tmp/x", **kwargs)
+    assert getattr(config, "max_length", None) == 4096 or getattr(config, "max_seq_length", None) == 4096
+
+
+def test_training_stops_when_most_examples_are_dropped():
+    import pytest
+
+    from finetune.train_unsloth import check_no_examples_dropped
+
+    check_no_examples_dropped(11894, 11894)
+    check_no_examples_dropped(11894, 11800)  # under 1% lost: fine
+    with pytest.raises(SystemExit, match="1121 of 11894"):
+        check_no_examples_dropped(11894, 1121)
