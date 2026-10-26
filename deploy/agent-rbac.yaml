@@ -1,0 +1,80 @@
+# The agent's own identity in the cluster, instead of the admin kubeconfig.
+# deploy/setup_secure_demo.py applies this file, adds one RoleBinding per
+# managed namespace (kube-agent-write) and writes the kubeconfig the demo
+# uses (AGENT_KUBECONFIG).
+#
+#   - read:  workloads, pods, logs, events, services, configmaps -- cluster
+#            wide, so listings work. Never Secrets.
+#   - write: get/create/update/patch on workloads and Secrets, ONLY in the
+#            managed namespaces (RoleBindings). Never delete. Never the
+#            keycloak namespace -- the agent can't change the login system.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-system
+  labels:
+    app.kubernetes.io/part-of: cluster-agent-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-agent
+  namespace: agent-system
+---
+# A long-lived token for the demo's kubeconfig (a local demo; a real
+# deployment would use short-lived tokens from `kubectl create token`).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kube-agent-token
+  namespace: agent-system
+  annotations:
+    kubernetes.io/service-account.name: kube-agent
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-agent-read
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, endpoints, events, namespaces, replicationcontrollers, configmaps, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-agent-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-agent-read
+subjects:
+  - kind: ServiceAccount
+    name: kube-agent
+    namespace: agent-system
+---
+# Granted per managed namespace by RoleBindings (see the setup script).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-agent-write
+rules:
+  - apiGroups: [""]
+    resources: [pods, replicationcontrollers, services, configmaps, secrets]
+    verbs: [get, create, update, patch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, create, update, patch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, create, update, patch]

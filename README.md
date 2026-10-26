@@ -366,8 +366,7 @@ finetune/.venv/bin/python -m finetune.evaluate \
     --test-file dataset/output-multi-defect/test.jsonl \
     --output-dir runs/<generated-name>/eval
 finetune/.venv/bin/python -m finetune.run_scenarios \
-    --adapter runs/<generated-name>/lora_adapter \
-    --output runs/<generated-name>/scenarios_results.xlsx
+    --adapter runs/<generated-name>/lora_adapter   # writes runs/<generated-name>/scenarios_results.xlsx
 ```
 
 The single-defect commands are identical minus `--strategy multi-defect`
@@ -417,22 +416,37 @@ its image, a nonexistent binary, mistyped paths and an invalid `volumeID`:
 none can be labeled programmatically without guessing intent. That's
 reported as an honest scope boundary, not a failing test.
 
-**`finetune/run_scenarios.py`** runs a checkpoint against every scenario file
-several times (sampled, `temperature>0`, so repeated runs can actually
-differ) and scores it against `test_cases.yaml`, producing an Excel report
-with `Detecção` and `Corrigido` sheets (`Arquivo | Erros | Detectado/Corrigido
-| Não detectado/corrigido | % OK`, averaged across the sampled runs) plus a
-`Categorias` breakdown and the raw ground truth for reference. "Corrected"
-is checked automatically by running `dataset/detect.py`'s `detect_file`
-(every rule, including cross-document checks) on the manifest after the
-model's own patch — if no finding matching that instance survives, it's
-fixed. Findings the ground truth doesn't list (e.g. KSEC-003 on
-`8-newrelic.yaml`'s host-level monitoring agent) are accepted as extras:
-they don't count against the score. Re-scored this way, the
-`20260907-1545` Qwen2.5-Coder-7B multi-defect model (trained before
-multi-document examples existed) detects 74% and corrects 53% of the
-in-scope instances across 5 sampled runs; most misses are the
-cross-document selector fixes and the files whose defects sit in document 1.
+**`finetune/run_scenarios.py`** runs a checkpoint once against every
+scenario file, the way the model is used — deterministic (greedy) decoding,
+and each fix applied on its own — and writes one workbook next to the
+adapter, `scenarios_results.xlsx`:
+
+- **Results**: per scenario, the number of errors, detected/undetected and
+  corrected/uncorrected, and five metrics — precision, recall, F1-score,
+  accuracy and errors corrected;
+- **Outputs**: the model's raw answer per scenario, enough to re-score it.
+
+An error is *detected* when one of the model's findings matches it (rule,
+document, and the instance's keyword). It's *corrected* when applying the
+operations of that finding alone makes `dataset/detect.py`'s `detect_file`
+(every rule, including the cross-document checks) stop flagging it — an
+unrelated bad operation elsewhere in the answer doesn't cancel a correct
+fix. Precision counts a reported finding as right if it matches a
+ground-truth error or a real defect the ground truth doesn't list (e.g.
+KSEC-003 on `8-newrelic.yaml`'s host-level agent, confirmed by the
+detectors). Accuracy is per (file, rule): "does this file have a KSEC-00X
+problem?". Evidence masking (first 4 characters + `***`) is enforced when
+parsing the answer, so a model that miscounts characters isn't rejected
+for it — and never leaks a secret one character too long.
+
+Results on the 36 scenario errors:
+
+| Model | Precision | Recall | F1-score | Accuracy | Errors corrected |
+|---|---|---|---|---|---|
+| Qwen2.5-Coder-7B, no fine-tuning | 52.6% | 11.1% | 18.3% | 77.1% | 5.6% |
+| v4 (`20260928-0142`) | 97.0% | 75.0% | 84.6% | 93.3% | 75.0% |
+| v5 (`20261002-0109`) | 97.2% | 83.3% | 89.7% | 98.3% | 83.3% |
+| v6 (`20261003-0240`) | 94.7% | 88.9% | 91.7% | 98.3% | 86.1% |
 
 **`finetune/zero_shot_baseline.py`** sends the exact same `SYSTEM_PROMPT` to
 a *non-fine-tuned* base model via Ollama and scores the response with the
@@ -978,13 +992,11 @@ split-flag credentials newly caught.
   other sibling) pairing from one repository directory. Files mixing
   several workloads, or unrelated resources in a different order, are only
   represented by the scenarios, not by training data.
-- **`scenarios/test_cases.yaml`'s "Erro de Sintaxe/Config" category (9 of its
-  40 instances) is entirely outside the current 6-rule taxonomy** — typos,
-  an invalid `volumeID`, a nonexistent command binary, and all 4
-  cross-document selector mismatches. `finetune/run_scenarios.py` reports
-  this honestly (expected ~0% detected today) rather than silently excluding
-  it, so the report shows the taxonomy's actual scope, not an inflated
-  score.
+- **The scenario ground truth covers what the rules can label.** Four of the
+  original sheet's 40 errors — two usernames, a container name that doesn't
+  match its image, and a cinder `volumeID` format — can't be labeled
+  programmatically without guessing intent, so they were removed from
+  `scenarios/test_cases.yaml`; the scenario results are over the other 36.
 
 ---
 
@@ -1016,6 +1028,8 @@ split-flag credentials newly caught.
 │   ├── report.py                 # diversity diagnostics
 │   ├── test_*.py                 # unit tests
 │   └── output/                   # generated: {mode}.jsonl, {mode}.curated.jsonl, report-*/
+├── demo/                         # cluster agent: Streamlit chat (Keycloak login, HTTPS), agent loop, cluster reset -- see demo/README.md
+├── deploy/                       # secured demo setup: Keycloak + agent RBAC manifests, setup_secure_demo.py
 ├── finetune/                     # fine-tuning: export, train, evaluate, infer -- own venv (Python 3.11)
 │   ├── export_for_unsloth.py     # renders the real chat template, drops oversized examples
 │   ├── train_unsloth.py          # Unsloth QLoRA training, hardware presets, auto-named runs/ folders

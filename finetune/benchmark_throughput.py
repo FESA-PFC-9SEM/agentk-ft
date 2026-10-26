@@ -76,6 +76,8 @@ def run(args: argparse.Namespace) -> list[dict]:
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import train_on_responses_only
 
+    from finetune.train_unsloth import sequence_length_kwargs
+
     print(f"Loading model {args.model}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
@@ -114,6 +116,9 @@ def run(args: argparse.Namespace) -> list[dict]:
                 max_seq_length=args.max_seq_length,
                 packing=False,
                 args=SFTConfig(
+                    # Same as train_unsloth.py: newer TRL ignores the
+                    # SFTTrainer keyword and would benchmark 1,024 tokens.
+                    **sequence_length_kwargs(args.max_seq_length),
                     max_steps=args.steps,
                     output_dir="/tmp/finetune_throughput_benchmark",
                     logging_steps=max(1, args.steps // 4),
