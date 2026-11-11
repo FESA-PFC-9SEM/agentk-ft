@@ -28,7 +28,7 @@ import yaml
 
 from dataset.detect import detect_file
 from dataset.schema import RULE_IDS, SYSTEM_PROMPT
-from finetune.evaluate import apply_multidoc_patch, parse_model_output, patch_ops_for_finding
+from finetune.evaluate import apply_multidoc_patch, parse_model_output, patch_ops_for_findings
 from finetune.metrics import paths_related, rule_confusions
 
 RESULTS_HEADER = [
@@ -72,10 +72,7 @@ def _finding_matches_instance(finding: dict, instance: dict) -> bool:
 def _corrected(instance: dict, docs: list[dict], findings: list[dict], patch: list[dict]) -> bool:
     """Apply only the operations of the model's findings for this error (the
     demo's "apply this fix") and check the detectors no longer flag it."""
-    ops = []
-    for finding in findings:
-        if _finding_matches_instance(finding, instance):
-            ops.extend(op for op in patch_ops_for_finding(finding, patch) if op not in ops)
+    ops = patch_ops_for_findings([f for f in findings if _finding_matches_instance(f, instance)], patch)
     if not ops:
         return False
     patched_docs, applied_ok = apply_multidoc_patch(docs, ops)

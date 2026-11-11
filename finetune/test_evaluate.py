@@ -248,3 +248,18 @@ def test_parse_model_output_enforces_the_evidence_mask():
     finding["evidence"] = "hunter2hunter2"
     response, _ = parse_model_output(json.dumps(dict(CLEAN_RESPONSE, findings=[finding])))
     assert response["findings"][0]["evidence"] == "hunt***"
+
+
+def test_patch_ops_for_findings_links_a_split_flag_fix_and_keeps_both_removes():
+    from finetune.evaluate import patch_ops_for_finding, patch_ops_for_findings
+
+    finding = {"rule_id": "KSEC-001", "doc": 0, "path": "/spec/containers/0/args/2"}
+    patch = [
+        {"doc": 0, "op": "remove", "path": "/spec/containers/0/args/1"},
+        {"doc": 0, "op": "remove", "path": "/spec/containers/0/args/1"},
+        {"doc": 0, "op": "replace", "path": "/spec/containers/0/image", "value": "x:1"},
+    ]
+    assert patch_ops_for_finding(finding, patch) == patch[:2]
+    assert len(patch_ops_for_findings([finding, finding], patch)) == 2
+    # Only for credentials: another rule's finding doesn't claim the item before it.
+    assert patch_ops_for_finding(dict(finding, rule_id="KSEC-005"), patch) == []

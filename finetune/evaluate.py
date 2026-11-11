@@ -39,6 +39,7 @@ from dataset.schema import RULE_IDS, mask_evidence, validate_response
 from finetune.metrics import confusion, paths_related, prf, rule_confusions
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?|\n?```\s*$", re.MULTILINE)
+_CLI_ITEM_RE = re.compile(r"^(.*/(?:command|args))/(\d+)$")
 
 
 def strip_fences(text: str) -> str:
@@ -111,14 +112,35 @@ def patch_ops_for_finding(finding: dict, patch_ops: list[dict]) -> list[dict]:
     "apply just this finding". A patch op relates to a finding if they're in
     the same doc and the op's path is the finding's path or an ancestor of it
     -- mutators sometimes replace a whole list element (e.g. `.../env/1`) to
-    fix something a finding reports more specifically (`.../env/1/value`)."""
+    fix something a finding reports more specifically (`.../env/1/value`).
+    A credential passed as a separate CLI flag value (`--password s3cr3t`)
+    is reported at the value's index and fixed by removing the flag before
+    it twice, so for KSEC-001 a `remove` of the preceding command/args item
+    belongs to the finding too."""
     doc = finding.get("doc", 0)
     fpath = finding.get("path", "")
+    flag_path = None
+    cli_item = _CLI_ITEM_RE.match(fpath)
+    if finding.get("rule_id") == "KSEC-001" and cli_item and int(cli_item.group(2)) > 0:
+        flag_path = f"{cli_item.group(1)}/{int(cli_item.group(2)) - 1}"
     return [
         op
         for op in patch_ops
-        if op.get("doc", 0) == doc and (fpath == op.get("path", "") or fpath.startswith(op.get("path", "") + "/"))
+        if op.get("doc", 0) == doc
+        and (
+            fpath == op.get("path", "")
+            or fpath.startswith(op.get("path", "") + "/")
+            or (flag_path is not None and op.get("op") == "remove" and op.get("path") == flag_path)
+        )
     ]
+
+
+def patch_ops_for_findings(findings: list[dict], patch_ops: list[dict]) -> list[dict]:
+    """The ops of any of these findings, in patch order, each op once. By
+    identity, not equality: a split-flag fix is two identical `remove` ops,
+    and both are needed."""
+    selected = {id(op) for finding in findings for op in patch_ops_for_finding(finding, patch_ops)}
+    return [op for op in patch_ops if id(op) in selected]
 
 
 def match_findings(expected: list[dict], predicted: list[dict]) -> dict:

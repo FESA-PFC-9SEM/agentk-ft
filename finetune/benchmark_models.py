@@ -25,6 +25,15 @@ over the rules. Per sample, "expected" is the set of rules in the reference
 answer, "predicted" the set in the model's answer (an invalid answer
 predicts nothing).
 
+Detection and correction, per individual error (as finetune/run_scenarios.py
+scores the scenarios): an error is detected when a reported finding matches
+it, and corrected when applying only that finding's patch operations makes
+the project's detectors (dataset/detect.py) stop flagging it. The errors are
+the ground-truth instances of scenarios/test_cases.yaml (scenarios) or the
+reference answer's findings (test set). A reported finding is right when it
+matches an error or a real defect the detectors confirm, otherwise a false
+positive.
+
 Measurement: one sample at a time (batch size 1), greedy decoding, up to
 --max-new-tokens. A streamer timestamps the first generated token (TTFT) and
 counts every generated token; a background thread samples CPU, RAM and VRAM
@@ -42,6 +51,8 @@ import statistics
 import threading
 import time
 from pathlib import Path
+
+from finetune.metrics import paths_related
 
 RULES = [f"KSEC-{i:03d}" for i in range(1, 13)]
 DEFAULT_TEST_FILE = "dataset/output-multi-defect-v6/test.jsonl"
@@ -66,9 +77,65 @@ def scenario_samples() -> list[dict]:
     for index, path in enumerate(load_scenario_files(Path("scenarios"), cases)):
         text = path.read_text(encoding="utf-8")
         expected = {i["rule_id"] for i in cases[path.name]} | {f.rule_id for f in detect_file(list(yaml.safe_load_all(text)))}
-        rows.append({"_index": index, "_name": path.name, "_expected": sorted(expected),
+        rows.append({"_index": index, "_name": path.name, "_expected": sorted(expected), "_instances": cases[path.name],
                      "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]})
     return rows
+
+
+def _same_problem(a: dict, b: dict) -> bool:
+    return (
+        a.get("rule_id") == b.get("rule_id")
+        and a.get("doc", 0) == b.get("doc", 0)
+        and paths_related(str(a.get("path", "")), str(b.get("path", "")))
+    )
+
+
+def score_sample(row: dict, raw_output: str) -> dict:
+    """Detection and correction of every error in one sample, and right /
+    false-positive counts of the reported findings -- no model involved."""
+    from dataset.detect import detect_file
+    from finetune.evaluate import apply_multidoc_patch, parse_manifest, parse_model_output, patch_ops_for_findings
+    from finetune.run_scenarios import score_run
+
+    docs = parse_manifest(row["messages"][1]["content"])
+    if "_instances" in row:
+        scored = score_run(docs, row["_instances"], raw_output)
+        errors = [{"id": f"#{i['id']}", "rule": i["rule_id"], **scored["instances"][i["id"]]} for i in row["_instances"]]
+        return {"errors": errors, "right": scored["right"], "false_positives": scored["false_positives"]}
+
+    reference = json.loads(row["messages"][2]["content"])["findings"]
+    response, _ = parse_model_output(raw_output)
+    findings = response.get("findings", []) if response else []
+    patch = response.get("patch", []) if response else []
+    real = [f.to_dict() for f in detect_file(docs)]
+    unmatched, matched = list(range(len(reference))), {}
+    right = false_positives = 0
+    for finding in findings:
+        hit = next((i for i in unmatched if _same_problem(reference[i], finding)), None)
+        if hit is not None:
+            unmatched.remove(hit)
+            matched[hit] = finding
+        if hit is not None or any(_same_problem(r, finding) for r in real):
+            right += 1
+        else:
+            false_positives += 1
+
+    def corrected(error: dict, finding: dict) -> bool:
+        ops = patch_ops_for_findings([finding], patch)
+        if not ops:
+            return False
+        patched_docs, applied_ok = apply_multidoc_patch(docs, ops)
+        # Evidence too: removing one CLI credential shifts the list, and a
+        # second credential can slide into the fixed one's index.
+        return applied_ok and not any(
+            _same_problem(d, error) and d.get("evidence") == error.get("evidence") for d in (f.to_dict() for f in detect_file(patched_docs))
+        )
+
+    errors = [
+        {"id": f"{row['_index']}:{i}", "rule": e["rule_id"], "detected": i in matched, "corrected": i in matched and corrected(e, matched[i])}
+        for i, e in enumerate(reference)
+    ]
+    return {"errors": errors, "right": right, "false_positives": false_positives}
 
 
 def select_samples(test_file: Path, tokenizer, n: int | None, seed: int, max_seq_length: int, max_new_tokens: int) -> list[dict]:
@@ -199,6 +266,7 @@ def run(args: argparse.Namespace) -> None:
                 "generated_tokens": streamer.generated_tokens,
                 "latency_s": end - start,
                 "ttft_s": (streamer.first_token_time - start) if streamer.first_token_time else None,
+                "raw_output": text,
             }
             results.append(record)
             fh.write(json.dumps(record) + "\n")
@@ -211,6 +279,19 @@ def run(args: argparse.Namespace) -> None:
                     flush=True,
                 )
     sampler.stop()
+
+    # Detection/correction scoring runs after the measured loop, so it
+    # doesn't show up in the resource samples.
+    for row, record in zip(samples, results):
+        record.update(score_sample(row, record["raw_output"]))
+    with (out_dir / "samples.jsonl").open("w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(record) + "\n" for record in results)
+    errors = [e for r in results for e in r["errors"]]
+    print(
+        f"[{args.label}] {len(errors)} errors | detected {sum(e['detected'] for e in errors) / max(len(errors), 1):.3f} | "
+        f"corrected {sum(e['corrected'] for e in errors) / max(len(errors), 1):.3f}",
+        flush=True,
+    )
 
     import psutil
 
@@ -299,14 +380,12 @@ def wilson(successes: int, total: int) -> tuple[float, float]:
     return proportion_confint(successes, total, alpha=0.05, method="wilson")
 
 
-def mcnemar_test(a: list[dict], b: list[dict]) -> dict:
-    """McNemar's test on per-sample exact-match correctness of two models
-    over the same samples. Exact binomial version when there are few
-    discordant pairs, chi-square with continuity correction otherwise."""
+def _mcnemar(pairs: list[tuple[bool, bool]]) -> dict:
+    """McNemar's test on paired right/wrong outcomes of two models. Exact
+    binomial version when there are few discordant pairs, chi-square with
+    continuity correction otherwise."""
     from statsmodels.stats.contingency_tables import mcnemar
 
-    by_index = {s["index"]: s for s in b}
-    pairs = [(s["expected"] == s["predicted"], by_index[s["index"]]["expected"] == by_index[s["index"]]["predicted"]) for s in a if s["index"] in by_index]
     both = sum(x and y for x, y in pairs)
     only_a = sum(x and not y for x, y in pairs)
     only_b = sum(y and not x for x, y in pairs)
@@ -317,12 +396,17 @@ def mcnemar_test(a: list[dict], b: list[dict]) -> dict:
             "method": "exact binomial" if exact else "chi-square (continuity corrected)", "statistic": float(result.statistic), "p_value": float(result.pvalue)}
 
 
+def mcnemar_test(a: list[dict], b: list[dict]) -> dict:
+    """McNemar's test on per-sample exact-match correctness of two models
+    over the same samples."""
+    by_index = {s["index"]: s for s in b}
+    return _mcnemar([(s["expected"] == s["predicted"], by_index[s["index"]]["expected"] == by_index[s["index"]]["predicted"]) for s in a if s["index"] in by_index])
+
+
 def mcnemar_decisions(a: list[dict], b: list[dict]) -> dict:
     """McNemar's test on every (sample, rule) yes/no decision -- many more
     paired observations than per-sample exact match (10 x 12 = 120 on the
     scenarios), so it can detect smaller differences."""
-    from statsmodels.stats.contingency_tables import mcnemar
-
     by_index = {s["index"]: s for s in b}
     pairs = []
     for s in a:
@@ -332,14 +416,30 @@ def mcnemar_decisions(a: list[dict], b: list[dict]) -> dict:
         for rule in RULES:
             truth = rule in s["expected"]
             pairs.append(((rule in s["predicted"]) == truth, (rule in other["predicted"]) == truth))
-    both = sum(x and y for x, y in pairs)
-    only_a = sum(x and not y for x, y in pairs)
-    only_b = sum(y and not x for x, y in pairs)
-    neither = sum(not x and not y for x, y in pairs)
-    exact = only_a + only_b < 25
-    result = mcnemar([[both, only_a], [only_b, neither]], exact=exact, correction=True)
-    return {"n": len(pairs), "both_correct": both, "only_first": only_a, "only_second": only_b, "both_wrong": neither,
-            "method": "exact binomial" if exact else "chi-square (continuity corrected)", "statistic": float(result.statistic), "p_value": float(result.pvalue)}
+    return _mcnemar(pairs)
+
+
+def mcnemar_errors(a: list[dict], b: list[dict], outcome: str) -> dict:
+    """McNemar's test on every individual error, paired by error id:
+    `outcome` is "detected" or "corrected"."""
+    other = {e["id"]: e[outcome] for s in b for e in s["errors"]}
+    return _mcnemar([(e[outcome], other[e["id"]]) for s in a for e in s["errors"] if e["id"] in other])
+
+
+def detection_correction(samples: list[dict]) -> dict:
+    """Totals per individual error, plus finding-level precision/F1: recall
+    is the detection rate, precision the share of reported findings that
+    are right."""
+    errors = [e for s in samples for e in s["errors"]]
+    detected, corrected = sum(e["detected"] for e in errors), sum(e["corrected"] for e in errors)
+    right, false_positives = sum(s["right"] for s in samples), sum(s["false_positives"] for s in samples)
+    recall = detected / len(errors) if errors else 0.0
+    precision = right / (right + false_positives) if right + false_positives else 0.0
+    return {
+        "errors": len(errors), "detected": detected, "corrected": corrected, "right": right, "false_positives": false_positives,
+        "detection rate": recall, "correction rate": corrected / len(errors) if errors else 0.0,
+        "precision": precision, "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+    }
 
 
 def resources(meta: dict) -> dict:
@@ -362,6 +462,7 @@ def report(args: argparse.Namespace) -> None:
     common = set.intersection(*(set(s["index"] for s in runs[l]["samples"]) for l in order))
 
     table1, table2, table3, mcnemar_rows, per_class, confusion_rows = [], [], [], [], [], []
+    table_dc, dc_per_sample, dc_per_rule = [], [], []
     for label in order:
         samples = [s for s in runs[label]["samples"] if s["index"] in common]
         meta = runs[label]["meta"]
@@ -377,6 +478,23 @@ def report(args: argparse.Namespace) -> None:
             "mean latency per sample (s)": statistics.mean(s["latency_s"] for s in samples),
             "throughput (generated tokens/s)": total_tokens / total_time,
         })
+        dc = detection_correction(samples)
+        table_dc.append({
+            "model": label, "no. errors": dc["errors"], "no. detected errors": dc["detected"], "no. undetected errors": dc["errors"] - dc["detected"],
+            "no. corrected errors": dc["corrected"], "no. uncorrected errors": dc["errors"] - dc["corrected"],
+            "detection rate (recall)": dc["detection rate"], "correction rate": dc["correction rate"],
+            "precision (findings)": dc["precision"], "F1 (findings)": dc["f1"], "false positives": dc["false_positives"],
+        })
+        for s in samples + [{"name": "TOTAL", "errors": [e for s in samples for e in s["errors"]]}]:
+            n, det, cor = len(s["errors"]), sum(e["detected"] for e in s["errors"]), sum(e["corrected"] for e in s["errors"])
+            dc_per_sample.append({"model": label, "scenario / sample": s["name"], "no. errors": n, "no. detected errors": det,
+                                  "no. undetected errors": n - det, "no. corrected errors": cor, "no. uncorrected errors": n - cor})
+        for rule in RULES:
+            errors = [e for s in samples for e in s["errors"] if e["rule"] == rule]
+            if errors:
+                det, cor = sum(e["detected"] for e in errors), sum(e["corrected"] for e in errors)
+                dc_per_rule.append({"model": label, "rule": rule, "no. errors": len(errors), "no. detected errors": det, "no. corrected errors": cor,
+                                    "detection rate": det / len(errors), "correction rate": cor / len(errors)})
         r = resources(meta)
         ttft = [s["ttft_s"] for s in samples if s["ttft_s"] is not None]
         table2.append({
@@ -396,6 +514,8 @@ def report(args: argparse.Namespace) -> None:
         for metric, (m, sd, lo, hi) in (
             ("accuracy (exact match)", (statistics.mean(correct), statistics.stdev(correct), acc_low, acc_high)),
             ("F1 (macro), bootstrap", (f1_mean, f1_std, f1_low, f1_high)),
+            ("detection rate (per error), bootstrap", bootstrap(samples, lambda xs: detection_correction(xs)["detection rate"], args.bootstrap)),
+            ("correction rate (per error), bootstrap", bootstrap(samples, lambda xs: detection_correction(xs)["correction rate"], args.bootstrap)),
             ("latency per sample (s)", lat),
             ("throughput per sample (tokens/s)", tps),
             ("TTFT (s)", tt),
@@ -413,22 +533,35 @@ def report(args: argparse.Namespace) -> None:
                                  **mcnemar_test(runs[first]["samples"], runs[second]["samples"])})
             mcnemar_rows.append({"comparison": f"{first} vs {second}", "unit": "sample x rule decision",
                                  **mcnemar_decisions(runs[first]["samples"], runs[second]["samples"])})
+            for outcome in ("detected", "corrected"):
+                mcnemar_rows.append({"comparison": f"{first} vs {second}", "unit": f"error ({outcome})",
+                                     **mcnemar_errors(runs[first]["samples"], runs[second]["samples"], outcome)})
 
     xlsx = out / "benchmark_results.xlsx"
     with pd.ExcelWriter(xlsx) as writer:
         pd.DataFrame(table1).to_excel(writer, sheet_name="Table 1 - quality & speed", index=False)
+        pd.DataFrame(table_dc).to_excel(writer, sheet_name="Detection & correction", index=False)
+        pd.DataFrame(dc_per_sample).to_excel(writer, sheet_name="Detect & correct per sample", index=False)
+        pd.DataFrame(dc_per_rule).to_excel(writer, sheet_name="Detect & correct per rule", index=False)
         pd.DataFrame(table2).to_excel(writer, sheet_name="Table 2 - resources", index=False)
         pd.DataFrame(table3).to_excel(writer, sheet_name="Table 3 - statistics", index=False)
         pd.DataFrame(mcnemar_rows).to_excel(writer, sheet_name="Table 3 - McNemar", index=False)
         pd.DataFrame(per_class).to_excel(writer, sheet_name="Per-class report", index=False)
         pd.DataFrame(confusion_rows).to_excel(writer, sheet_name="Confusion matrices", index=False)
         for label in order:
-            pd.DataFrame(runs[label]["samples"]).to_excel(writer, sheet_name=f"Samples {label}"[:31], index=False)
+            rows = [
+                {**{k: v for k, v in s.items() if k not in ("errors", "raw_output")},
+                 "detected errors": ", ".join(e["id"] for e in s["errors"] if e["detected"]) or "-",
+                 "corrected errors": ", ".join(e["id"] for e in s["errors"] if e["corrected"]) or "-",
+                 "raw output": s["raw_output"]}
+                for s in runs[label]["samples"]
+            ]
+            pd.DataFrame(rows).to_excel(writer, sheet_name=f"Samples {label}"[:31], index=False)
         for ws in writer.book.worksheets:
             for column in ws.columns:
                 ws.column_dimensions[column[0].column_letter].width = max(12, min(48, max(len(str(c.value or "")) for c in column) + 2))
 
-    write_markdown(out, order, runs, table1, table2, table3, mcnemar_rows, len(common))
+    write_markdown(out, order, runs, table1, table_dc, table2, table3, mcnemar_rows, len(common))
     print(f"Written to {xlsx} and {out / 'report.md'}")
 
 
@@ -436,7 +569,7 @@ def _pct(x: float) -> str:
     return f"{100 * x:.1f}%"
 
 
-def write_markdown(out, order, runs, table1, table2, table3, mcnemar_rows, n) -> None:
+def write_markdown(out, order, runs, table1, table_dc, table2, table3, mcnemar_rows, n) -> None:
     meta0 = runs[order[0]]["meta"]
     source = (
         f"The {n} hand-written scenario files (`scenarios/*.yaml`); reference rules per file = `scenarios/test_cases.yaml` plus real "
@@ -445,7 +578,7 @@ def write_markdown(out, order, runs, table1, table2, table3, mcnemar_rows, n) ->
         else f"Held-out test set `{meta0['test_file']}` -- {n} samples (seed {meta0['seed']}; the same samples for every model)."
     )
     lines = [
-        "# Model benchmark: fine-tuned Qwen2.5-Coder manifest auditors",
+        "# Model benchmark: Qwen2.5-Coder manifest auditors",
         "",
         source + f" Evaluated on an {meta0['gpu']} ({meta0['gpu_total_gb']:.1f} GB): greedy decoding, batch size 1, "
         f"up to {meta0['max_new_tokens']} new tokens.",
@@ -473,6 +606,29 @@ def write_markdown(out, order, runs, table1, table2, table3, mcnemar_rows, n) ->
         "time of one `generate()` call (prefill + decoding), GPU synchronized. Per-class reports and confusion matrices are in "
         "`benchmark_results.xlsx`.",
         "",
+        "## Table 1b - Detection and correction (per individual error)",
+        "",
+        "| Model | Errors | Detected | Undetected | Corrected | Uncorrected | Detection rate (recall) | Correction rate | Precision (findings) | F1 (findings) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in table_dc:
+        lines.append(
+            f"| {r['model']} | {r['no. errors']} | {r['no. detected errors']} | {r['no. undetected errors']} | {r['no. corrected errors']} | "
+            f"{r['no. uncorrected errors']} | {_pct(r['detection rate (recall)'])} | {_pct(r['correction rate'])} | "
+            f"{_pct(r['precision (findings)'])} | {_pct(r['F1 (findings)'])} |"
+        )
+    errors_source = (
+        "the ground-truth instances in `scenarios/test_cases.yaml`"
+        if meta0.get("source") == "scenarios"
+        else "the findings in each sample's reference answer"
+    )
+    lines += [
+        "",
+        f"Errors are {errors_source}. An error is *detected* when a reported finding matches it (same rule and document, and the "
+        "same location), and *corrected* when applying only that finding's patch operations makes the project's own detectors "
+        "(`dataset/detect.py`) stop flagging it. *Precision* is the share of reported findings that are right: they match an error, "
+        "or a real defect the detectors confirm. Per-sample and per-rule counts are in `benchmark_results.xlsx`.",
+        "",
         "## Table 2 - Resource usage (during inference)",
         "",
         "| Model | CPU % mean / peak | RAM GB mean / peak | VRAM GB mean / peak | TTFT (s) mean ± std |",
@@ -496,16 +652,17 @@ def write_markdown(out, order, runs, table1, table2, table3, mcnemar_rows, n) ->
         "|---|---|---|---|",
     ]
     for r in table3:
-        fmt = (lambda x: _pct(x)) if "accuracy" in r["metric"] or "F1" in r["metric"] else (lambda x: f"{x:.3f}")
+        fmt = (lambda x: _pct(x)) if any(k in r["metric"] for k in ("accuracy", "F1", "rate")) else (lambda x: f"{x:.3f}")
         lines.append(f"| {r['model']} | {r['metric']} | {fmt(r['mean'])} ± {fmt(r['std'])} | [{fmt(r['CI95 low'])}, {fmt(r['CI95 high'])}] |")
     lines += [
         "",
-        "Accuracy: per-sample correctness (0/1), Wilson CI95. Macro F1: 2,000 bootstrap resamples of the samples (mean, std, percentile "
-        "CI95). Latency, throughput and TTFT: per-sample values, t-distribution CI95 of the mean.",
+        "Accuracy: per-sample correctness (0/1), Wilson CI95. Macro F1, detection rate and correction rate: 2,000 bootstrap resamples of "
+        "the samples (mean, std, percentile CI95; whole samples are resampled because errors in the same file aren't independent). "
+        "Latency, throughput and TTFT: per-sample values, t-distribution CI95 of the mean.",
         "",
-        "**McNemar's test** (paired, same samples; exact binomial when there are fewer than 25 discordant pairs). Two units: per sample "
-        "(exact match right/wrong) and per sample x rule decision (each of the 12 rules judged present/absent correctly or not -- more "
-        "observations, more power):",
+        "**McNemar's test** (paired, same samples; exact binomial when there are fewer than 25 discordant pairs). Four units: per sample "
+        "(exact match right/wrong), per sample x rule decision (each of the 12 rules judged present/absent correctly or not -- more "
+        "observations, more power), and per individual error (detected or not; corrected or not):",
         "",
         "| Comparison | Unit | n | Both right | Only first right | Only second right | Both wrong | Method | p-value |",
         "|---|---|---|---|---|---|---|---|---|",
