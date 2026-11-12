@@ -1,0 +1,162 @@
+# PostgreSQL for the audit trail of the agent's cluster changes, in its own
+# namespace. Like `keycloak`, the agent's service account has no write
+# access here (deploy/agent-rbac.yaml) and the agent's tools refuse and hide
+# this namespace (demo/core.py PROTECTED_NAMESPACES).
+#
+# Secrets and the schema are handled by deploy/setup_secure_demo.py (they
+# hold generated passwords), which then applies this file:
+#   postgres-credentials -- superuser password
+#   postgres-tls         -- TLS certificate signed by the demo's local CA
+# The app connects as `audit_writer`, a role that may only INSERT and SELECT
+# (deploy/audit-schema.sql), over TLS (remote connections without TLS are
+# rejected by pg_hba.conf below).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: audit
+  labels:
+    app.kubernetes.io/part-of: cluster-agent-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: audit
+data:
+  pg_hba.conf: |
+    # The Unix socket is only reachable inside the pod (probes, kubectl exec).
+    local     all  all                 trust
+    host      all  all  127.0.0.1/32   scram-sha-256
+    # Everything else: TLS + password, or nothing.
+    hostssl   all  all  0.0.0.0/0      scram-sha-256
+    hostnossl all  all  0.0.0.0/0      reject
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: audit
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999  # the image's postgres user
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16.15@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+          args:
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/etc/postgres-tls/tls.crt
+            - -c
+            - ssl_key_file=/etc/postgres-tls/tls.key
+            - -c
+            - hba_file=/etc/postgres-config/pg_hba.conf
+            - -c
+            - password_encryption=scram-sha-256
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+            - name: POSTGRES_DB
+              value: audit
+            # A subdirectory of the volume, so initdb creates it with the
+            # right owner whatever the volume's root looks like.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "audit"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "audit"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: tls
+              mountPath: /etc/postgres-tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/postgres-config
+              readOnly: true
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: postgres-tls
+            # Root-owned, group-readable: what PostgreSQL accepts for a key
+            # file it doesn't own (group = fsGroup 999).
+            defaultMode: 0640
+        - name: config
+          configMap:
+            name: postgres-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: audit
+spec:
+  type: NodePort
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      nodePort: 30432

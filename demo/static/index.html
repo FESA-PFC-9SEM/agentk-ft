@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes Manifest Security Auditor — Demo</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161d2e; --panel-2: #1d2740; --border: #2a3550;
+    --text: #e6eaf3; --muted: #93a0bd; --accent: #5b9dff;
+    --ok: #35c48c; --bad: #ff5c7a; --warn: #ffb84d;
+    --crit: #ff4d6d; --high: #ff9d4d; --med: #ffd24d; --low: #6fb8ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; white-space: nowrap; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+  .pill {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 10px; color: var(--muted); display: flex; align-items: center; gap: 5px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 300px; flex: none; background: var(--panel); border-right: 1px solid var(--border);
+    padding: 14px; overflow-y: auto;
+  }
+  @media (max-width: 800px) { main { flex-direction: column; } aside { width: auto; border-right: none; border-bottom: 1px solid var(--border); } }
+
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  select, textarea, input[type=text] {
+    width: 100%; background: #0d1220; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 8px; font-size: 13px; font-family: inherit;
+  }
+  select { margin-bottom: 8px; }
+  button {
+    background: var(--accent); color: #08101f; border: none; border-radius: 6px;
+    padding: 7px 12px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 500; }
+  .row { display: flex; gap: 6px; }
+  .row > * { flex: 1; }
+  label.chk { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin: 6px 0; }
+  .gt-list { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+  .gt-list b { color: var(--text); }
+
+  .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .thread { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 860px; }
+  .msg.assistant { align-self: flex-start; }
+  .msg.user { align-self: flex-end; }
+  .bubble { border-radius: 12px; padding: 12px 14px; border: 1px solid var(--border); }
+  .msg.assistant .bubble { background: var(--panel); }
+  .msg.user .bubble { background: #1a2b52; }
+  .who { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  pre {
+    background: #0a0e18; border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    overflow-x: auto; font-size: 12px; margin: 6px 0; white-space: pre-wrap; word-break: break-word;
+  }
+  details summary { cursor: pointer; font-size: 12px; color: var(--muted); margin: 6px 0; }
+
+  .finding { border-left: 4px solid var(--muted); border-radius: 6px; background: #0d1220; padding: 8px 10px; margin: 6px 0; }
+  .finding.critical { border-color: var(--crit); } .finding.high { border-color: var(--high); }
+  .finding.medium { border-color: var(--med); } .finding.low { border-color: var(--low); }
+  .finding .top { display: flex; gap: 8px; align-items: center; font-size: 12px; margin-bottom: 3px; }
+  .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); }
+  .badge.critical { color: var(--crit); } .badge.high { color: var(--high); }
+  .badge.medium { color: var(--med); } .badge.low { color: var(--low); }
+  .path { color: var(--muted); font-family: monospace; font-size: 11px; }
+  .clean { color: var(--ok); font-weight: 600; font-size: 13px; }
+  .meta-line { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error-box { color: var(--bad); font-size: 13px; }
+
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 10px 16px; }
+  footer .row { align-items: flex-end; }
+  footer textarea { min-height: 64px; max-height: 200px; resize: vertical; font-family: monospace; }
+  footer button { width: auto; padding: 0 18px; align-self: stretch; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🛡️ Manifest Security Auditor — Demo</h1>
+  <div class="pills" id="pills">
+    <span class="pill"><span class="dot" id="dot-cluster"></span><span id="pill-context">kubectl: …</span></span>
+    <span class="pill" id="pill-model">model: …</span>
+    <span class="pill" id="pill-rules" title="">rules: …</span>
+  </div>
+</header>
+
+<main>
+  <aside>
+    <div class="card">
+      <h3>Load from live cluster</h3>
+      <select id="resource-select"><option>loading…</option></select>
+      <label class="chk"><input type="checkbox" id="include-system"> include kube-system namespaces</label>
+      <button id="btn-fetch-resource">Fetch YAML</button>
+    </div>
+
+    <div class="card">
+      <h3>Load a sample scenario</h3>
+      <select id="scenario-select"><option>loading…</option></select>
+      <button id="btn-load-scenario">Load</button>
+      <div class="gt-list" id="scenario-gt"></div>
+    </div>
+
+    <div class="card">
+      <h3>About</h3>
+      <div class="gt-list">
+        Paste or load a Kubernetes manifest, then click Analyze. The model
+        replies with a JSON audit: findings, an RFC&nbsp;6902 patch, and any
+        new resources needed. It only understands this one task — it will
+        not hold a general conversation.
+      </div>
+    </div>
+  </aside>
+
+  <section class="chat">
+    <div class="thread" id="thread"></div>
+    <footer>
+      <div class="row">
+        <textarea id="manifest-input" placeholder="Paste a Kubernetes manifest here, or load one from the left…"></textarea>
+        <button id="btn-analyze">Analyze ▶</button>
+      </div>
+    </footer>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const thread = $('thread');
+const manifestInput = $('manifest-input');
+
+function escapeHtml(s) {
+  return (s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function getJSON(url, opts) {
+  const res = await fetch(url, opts);
+  return res.json();
+}
+
+async function refreshStatus() {
+  try {
+    const s = await getJSON('/api/status');
+    $('pill-context').textContent = 'kubectl: ' + (s.kubectl_context || 'unavailable');
+    $('dot-cluster').className = 'dot ' + (s.cluster_reachable ? 'ok' : 'bad');
+    $('pill-model').textContent = 'model: ' + (s.base_model || '?') + ' + ' + (s.adapter ? s.adapter.split('/').slice(-2, -1)[0] : '?');
+    const ruleIds = Object.keys(s.rules || {});
+    const pillRules = $('pill-rules');
+    pillRules.textContent = 'rules: ' + ruleIds.length + ' active';
+    pillRules.title = ruleIds.map(id => id + ' — ' + s.rules[id]).join('\n');
+  } catch (e) { /* keep last known status on transient failure */ }
+}
+
+async function loadResources() {
+  const sel = $('resource-select');
+  sel.innerHTML = '<option>loading…</option>';
+  const includeSystem = $('include-system').checked;
+  const data = await getJSON('/api/resources?all=' + includeSystem);
+  if (data.error) {
+    sel.innerHTML = '<option value="">' + escapeHtml(data.error) + '</option>';
+    return;
+  }
+  if (!data.items.length) {
+    sel.innerHTML = '<option value="">(no matching resources found)</option>';
+    return;
+  }
+  sel.innerHTML = data.items.map(it =>
+    `<option value='${JSON.stringify(it)}'>${it.namespace} / ${it.kind} / ${it.name}</option>`
+  ).join('');
+}
+
+async function loadScenarioList() {
+  const sel = $('scenario-select');
+  const data = await getJSON('/api/scenarios');
+  sel.innerHTML = data.scenarios.map(name => `<option value="${name}">${name}</option>`).join('');
+}
+
+$('include-system').addEventListener('change', loadResources);
+
+$('btn-fetch-resource').addEventListener('click', async () => {
+  const sel = $('resource-select');
+  if (!sel.value) return;
+  const { kind, namespace, name } = JSON.parse(sel.value);
+  $('btn-fetch-resource').disabled = true;
+  try {
+    const data = await getJSON(`/api/resource-yaml?kind=${kind}&namespace=${namespace}&name=${name}`);
+    manifestInput.value = data.error ? ('# error fetching resource:\n# ' + data.error) : data.yaml;
+  } finally {
+    $('btn-fetch-resource').disabled = false;
+  }
+});
+
+$('btn-load-scenario').addEventListener('click', async () => {
+  const name = $('scenario-select').value;
+  if (!name) return;
+  const data = await getJSON('/api/scenarios/' + encodeURIComponent(name));
+  manifestInput.value = data.yaml || '';
+  const gt = $('scenario-gt');
+  if (data.ground_truth && data.ground_truth.length) {
+    gt.innerHTML = '<b>Known issues in this file (hand-labeled ground truth):</b><br>' +
+      data.ground_truth.map(c => `• [${c.rule_id || 'no rule'}] ${escapeHtml(c.description || c.category)}`).join('<br>');
+  } else {
+    gt.innerHTML = '';
+  }
+});
+
+function severityRank(sev) { return { critical: 0, high: 1, medium: 2, low: 3 }[sev] ?? 4; }
+
+function renderFindings(findings) {
+  if (!findings || !findings.length) return '<div class="clean">✓ No issues found</div>';
+  const sorted = [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity));
+  return sorted.map(f => `
+    <div class="finding ${f.severity}">
+      <div class="top">
+        <span class="badge ${f.severity}">${escapeHtml(f.severity)}</span>
+        <b>${escapeHtml(f.rule_id)}</b>
+        <span class="path">doc ${f.doc} · ${escapeHtml(f.path)}</span>
+      </div>
+      <div>${escapeHtml(f.message)}</div>
+      ${f.evidence ? `<div class="path">evidence: ${escapeHtml(f.evidence)}</div>` : ''}
+    </div>`).join('');
+}
+
+function renderResult(container, data) {
+  if (data.errors && data.errors.length && !data.parsed) {
+    container.innerHTML = `
+      <div class="error-box">Model output did not pass the schema check: ${escapeHtml(data.errors.join('; '))}</div>
+      <details><summary>raw model output</summary><pre>${escapeHtml(data.raw)}</pre></details>`;
+    return;
+  }
+  const p = data.parsed;
+  let html = renderFindings(p.findings);
+
+  if (p.patch && p.patch.length) {
+    html += `<details><summary>RFC 6902 patch (${p.patch.length} op${p.patch.length > 1 ? 's' : ''})</summary><pre>${escapeHtml(JSON.stringify(p.patch, null, 2))}</pre></details>`;
+    if (data.patched_yaml) {
+      html += `<details><summary>manifest after applying the patch</summary><pre>${escapeHtml(data.patched_yaml)}</pre></details>`;
+    } else if (data.patch_error) {
+      html += `<div class="error-box">patch did not apply cleanly: ${escapeHtml(data.patch_error)}</div>`;
+    }
+  }
+  if (p.new_resources && p.new_resources.length) {
+    html += p.new_resources.map(r => `<details><summary>new resource to create</summary><pre>${escapeHtml(r)}</pre></details>`).join('');
+  }
+  if (p.notes && p.notes.length) {
+    html += `<div class="meta-line">notes: ${p.notes.map(escapeHtml).join('; ')}</div>`;
+  }
+  html += `<details><summary>raw JSON</summary><pre>${escapeHtml(JSON.stringify(p, null, 2))}</pre></details>`;
+  html += `<div class="meta-line">generated in ${data.elapsed_seconds}s</div>`;
+  container.innerHTML = html;
+}
+
+function addMessage(role, bodyHtml) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = `<div class="who">${role === 'user' ? 'manifest sent' : 'model'}</div><div class="bubble">${bodyHtml}</div>`;
+  thread.appendChild(div);
+  thread.scrollTop = thread.scrollHeight;
+  return div;
+}
+
+$('btn-analyze').addEventListener('click', async () => {
+  const manifest = manifestInput.value.trim();
+  if (!manifest) return;
+
+  addMessage('user', `<details open><summary>manifest (${manifest.split(/\r?\n/).length} lines)</summary><pre>${escapeHtml(manifest)}</pre></details>`);
+  const reply = addMessage('assistant', '<span class="spinner"></span> analyzing…');
+  $('btn-analyze').disabled = true;
+
+  try {
+    const data = await getJSON('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manifest }),
+    });
+    if (data.error) {
+      reply.querySelector('.bubble').innerHTML = `<div class="error-box">${escapeHtml(data.error)}</div>`;
+    } else {
+      renderResult(reply.querySelector('.bubble'), data);
+    }
+  } catch (e) {
+    reply.querySelector('.bubble').innerHTML = `<div class="error-box">request failed: ${escapeHtml(String(e))}</div>`;
+  } finally {
+    $('btn-analyze').disabled = false;
+    thread.scrollTop = thread.scrollHeight;
+  }
+});
+
+addMessage('assistant',
+  'Hi! Load a manifest from the live cluster or a sample scenario on the left ' +
+  '(or paste your own below), then click <b>Analyze</b>. I read one Kubernetes ' +
+  'manifest per turn and reply with a structured security/configuration audit.');
+
+refreshStatus();
+loadResources();
+loadScenarioList();
+setInterval(refreshStatus, 10000);
+</script>
+</body>
+</html>

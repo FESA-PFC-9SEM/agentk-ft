@@ -1,0 +1,8 @@
+# Project-level Streamlit config, picked up automatically when `streamlit
+# run` is invoked from this directory (the repo root) -- e.g.
+# `finetune/.venv/bin/streamlit run demo/streamlit_app.py`.
+
+[server]
+# Don't auto-open a browser tab on every `streamlit run` -- the server still
+# starts and prints its Local URL to the terminal as usual.
+headless = true

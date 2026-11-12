@@ -1,0 +1,13 @@
+# Install into the SAME venv finetune/*.py runs in -- this demo imports
+# finetune.evaluate directly to load the model and generate:
+#   finetune/.venv/bin/python -m pip install -r demo/requirements.txt
+#
+# torch/unsloth/transformers/jsonpatch/pyyaml already come from
+# finetune/requirements.txt; flask and streamlit (one UI each -- see
+# demo/README.md) are the only genuinely new dependencies here.
+flask>=3.0
+streamlit>=1.42
+# Keycloak login: Streamlit's built-in OIDC (st.login) needs Authlib.
+Authlib>=1.3.2
+# Audit trail of the agent's changes (demo/audit_log.py), in PostgreSQL.
+psycopg[binary]>=3.2

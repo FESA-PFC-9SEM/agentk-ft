@@ -1,0 +1,743 @@
+# Baseline for namespace 'demo' -- written by demo/reset_cluster.py --snapshot.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiware-orionld
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: orionld
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: orionld
+      name: fiware-orion
+    spec:
+      containers:
+      - args:
+        - -dbhost
+        - orionld-mongodb-svc:27017
+        - -rplSet
+        - orionld-mongodb
+        - -dbuser
+        - "usuarioz\xE3o"
+        - -dbpwd
+        - '123456789'
+        - -dbAuthMech
+        - SCRAM-SHA-256
+        - -db
+        - orion
+        - -statCounters
+        - -statSemWait
+        - -statTiming
+        - -statNotifQueue
+        env:
+        - name: ORIONLD_MONGOCONLY
+          value: 'TRUE'
+        - name: DB_PASSWORD
+          value: hardcoded-password-123
+        - name: API_KEY
+          value: sk-1234567890abcdef
+        image: fiware/orion-ld
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /version
+            port: 1026
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: orion
+        ports:
+        - containerPort: 1026
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /version
+            port: 1026
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 500m
+            memory: 500Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: guestbook
+      tier: frontend
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: guestbook
+        tier: frontend
+    spec:
+      containers:
+      - env:
+        - name: GET_HOSTS_FROM
+          value: dns
+        - name: PASSWORD_SERVICE_HOST
+          value: '123456'
+        image: nginxs
+        imagePullPolicy: Always
+        name: php-redis
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: selenium-hub
+  labels:
+    app: selenium-hub
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: selenium-hub
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: selenium-hub
+    spec:
+      containers:
+      - env:
+        - name: GRID_HUB_PASSWORD
+          value: selenium-admin-2024
+        - name: DATABASE_URL
+          value: postgres://user:pass@localhost/selenium
+        image: selenium/hub
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /wd/hub/status
+            port: 4444
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: selenium-hub
+        ports:
+        - containerPort: 4444
+          protocol: TCP
+        - containerPort: 4443
+          protocol: TCP
+        - containerPort: 4442
+          protocol: TCP
+        - containerPort: 65000
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /wd/hub/status
+            port: 4444
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1000Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storm-worker-controller
+  labels:
+    name: storm-worker
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      name: storm-worker
+      uses: nimbus
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: storm-worker
+        uses: nimbus
+    spec:
+      containers:
+      - args:
+        - echo 'Worker stub iniciado...'; while true; do sleep 3600; done
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: STORM_NIMBUS_PASSWORD
+          value: storm-admin-123
+        - name: STORM_NIMBUS
+          value: nimbus.default.svc.cluster.local
+        - name: STORM_ZOOKEEPER_SERVERS
+          value: zookeeper.default.svc.cluster.local:2181
+        image: storm
+        imagePullPolicy: Always
+        name: storm-worker
+        ports:
+        - containerPort: 6700
+          hostPort: 6700
+          protocol: TCP
+        - containerPort: 6701
+          hostPort: 6701
+          protocol: TCP
+        - containerPort: 6702
+          hostPort: 6702
+          protocol: TCP
+        - containerPort: 6703
+          hostPort: 6703
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 30m
+            memory: 20Mi
+          requests:
+            cpu: 30m
+            memory: 10Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gemma-deployment
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: gemma-server
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: gemma-server
+    spec:
+      containers:
+      - args:
+        - 'echo "Mock vLLM server for testing"
+
+          python3 -m http.server 8080
+
+          '
+        command:
+        - python5
+        - -c
+        env:
+        - name: MODEL_ID
+          value: mock-model-for-testing
+        - name: HUGGING_FACE_HUB_TOKEN
+          value: hf_hardcoded_token_abc123xyz
+        - name: ADMIN_PASSWORD
+          value: admin123!@#
+        image: python:3.9-slim
+        imagePullPolicy: IfNotPresent
+        name: inference-server
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          sizeLimit: 64Mi
+        name: dshm
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: newrelic-agent
+  labels:
+    app: newrelic-agent
+    tier: monitoring
+    version: v1
+  annotations:
+    deprecated.daemonset.template.generation: '1'
+spec:
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      name: newrelic
+  template:
+    metadata:
+      labels:
+        name: newrelic
+    spec:
+      containers:
+      - args:
+        - "echo 'Container iniciado e em execu\xE7\xE3o...'; while true; do sleep\
+          \ 3600; done"
+        command:
+        - /bin/sh
+        - -c
+        - --
+        env:
+        - name: NRSYSMOND_logfile
+          value: /var/log/nrsysmond.log
+        - name: NEW_RELIC_LICENSE_KEY
+          value: abc123def456ghi789jkl
+        - name: API_SECRET
+          value: newrelic-api-key-2024
+        image: newrelic/infrastructure
+        imagePullPolicy: Always
+        name: newrelic
+        resources:
+          requests:
+            cpu: 100m
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /etc/kube-newrelic
+          name: newrelic-config
+          readOnly: true
+        - mountPath: /dev
+          name: dev
+        - mountPath: /var/run/docker.sock
+          name: run
+        - mountPath: /sys
+          name: sys
+        - mountPath: /var/log
+          name: log
+      dnsPolicy: ClusterFirst
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: newrelic-config
+        secret:
+          defaultMode: 420
+          secretName: newrelic-config
+      - hostPath:
+          path: /dev
+          type: ''
+        name: dev
+      - hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+        name: run
+      - hostPath:
+          path: /sys
+          type: ''
+        name: sys
+      - hostPath:
+          path: /var/log
+          type: ''
+        name: log
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: es
+  labels:
+    component: elasticsearch
+spec:
+  replicas: 1
+  selector:
+    component: elasticsearch
+  template:
+    metadata:
+      labels:
+        component: elasticsearch
+    spec:
+      containers:
+      - env:
+        - name: KUBERNETES_CA_CERTIFICATE_FILE
+          value: /variavel/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: CLUSTER_NAME
+          value: myesdb
+        - name: DISCOVERY_SERVICE
+          value: elasticsearch
+        - name: NODE_MASTER
+          value: 'true'
+        - name: NODE_DATA
+          value: 'true'
+        - name: HTTP_ENABLE
+          value: 'true'
+        - name: ELASTIC_PASSWORD
+          value: elastic123admin
+        - name: KIBANA_PASSWORD
+          value: kibana-secret-pass
+        image: quay.io/pires/docker-elasticsearch-kubernetes
+        imagePullPolicy: Always
+        name: es
+        ports:
+        - containerPort: 9200
+          name: http
+          protocol: TCP
+        - containerPort: 9300
+          name: transport
+          protocol: TCP
+        resources: {}
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data
+          name: storage
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - command:
+        - sysctl
+        - -w
+        - vm.max_map_count=262144
+        image: busybox
+        imagePullPolicy: IfNotPresent
+        name: init-sysctl
+        resources: {}
+        securityContext:
+          privileged: true
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: elasticsearch
+      serviceAccountName: elasticsearch
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          sizeLimit: 215Mi
+        name: storage
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: my-nginx
+  labels:
+    app: nginxs
+spec:
+  replicas: 1
+  selector:
+    app: nginxs
+  template:
+    metadata:
+      labels:
+        app: nginxs
+    spec:
+      containers:
+      - command:
+        - /hom/auto-reload-nginx.sh
+        env:
+        - name: SSL_CERT_PASSWORD
+          value: nginx-ssl-pass-123
+        - name: DB_CONNECTION
+          value: mysql://root:password@db:3306/app
+        image: ymqytw/nginxhttps
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /index.html
+            port: 80
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 30
+        name: nginxhttps
+        ports:
+        - containerPort: 443
+          protocol: TCP
+        - containerPort: 80
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /etc/nginx/ssl
+          name: secret-volume
+        - mountPath: /etc/nginx/conf.d
+          name: configmap-volume
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: secret-volume
+        secret:
+          defaultMode: 420
+          secretName: nginxsecret
+      - configMap:
+          defaultMode: 420
+          name: nginxconfigmap
+        name: configmap-volume
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql
+  labels:
+    name: mysql
+spec:
+  containers:
+  - args:
+    - --ignore-db-dir
+    - lost+found
+    env:
+    - name: MYSQL_ROOT_PASSWORD
+      value: mypassowrd 123
+    - name: MYSQL_USER
+      value: admin
+    - name: MYSQL_PASSWORD
+      value: hardcoded-mysql-pass-2024
+    image: my-sql
+    imagePullPolicy: Always
+    name: mysql
+    ports:
+    - containerPort: 3306
+      name: mysql
+      protocol: TCP
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 500m
+        memory: 256Mi
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /var/lib/mysql
+      name: mysql-persistent-storage
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  serviceAccount: default
+  serviceAccountName: default
+  terminationGracePeriodSeconds: 30
+  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 300
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    operator: Exists
+    tolerationSeconds: 300
+  volumes:
+  - cinder:
+      fsType: ext4
+      volumeID: bd82f7e2-wece-4c01-a505-4acf60b07f4a
+    name: mysql-persistent-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  labels:
+    component: elasticsearch
+spec:
+  allocateLoadBalancerNodePorts: true
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ports:
+  - name: http
+    nodePort: 32728
+    port: 9200
+    protocol: TCP
+    targetPort: 9200
+  - name: transport
+    nodePort: 31867
+    port: 9300
+    protocol: TCP
+    targetPort: 9300
+  selector:
+    component: elasticsearch
+  sessionAffinity: None
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fiware-orionld-service
+spec:
+  allocateLoadBalancerNodePorts: true
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 31685
+    port: 1027
+    protocol: TCP
+    targetPort: 1026
+  selector:
+    app: orionlds
+  sessionAffinity: None
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginxsvc
+  labels:
+    app: nginx
+spec:
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ports:
+  - name: http
+    nodePort: 32710
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: https
+    nodePort: 31551
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  selector:
+    app: nginx
+  sessionAffinity: None
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: selenium-hub
+  labels:
+    app: selenium-hub
+spec:
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ports:
+  - name: port0
+    nodePort: 30837
+    port: 4444
+    protocol: TCP
+    targetPort: 4444
+  - name: port1
+    nodePort: 32126
+    port: 4443
+    protocol: TCP
+    targetPort: 4443
+  - name: port2
+    nodePort: 30821
+    port: 4442
+    protocol: TCP
+    targetPort: 4442
+  selector:
+    app: sellenium-hub
+  sessionAffinity: None
+  type: NodePort

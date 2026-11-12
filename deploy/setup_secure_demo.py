@@ -11,7 +11,11 @@ One-time (and re-runnable) setup for the secured demo, on the local minikube:
   3. the agent's own service account with RBAC (deploy/agent-rbac.yaml):
      cluster-wide read without Secrets, writes only in the managed
      namespaces -- never in `keycloak` -- and a kubeconfig for it;
-  4. .streamlit/secrets.toml with the app's login settings.
+  4. PostgreSQL in its own `audit` namespace (deploy/postgres.yaml), the
+     audit schema (deploy/audit-schema.sql) and the app's append-only
+     `audit_writer` role -- every change the agent proposes and the user
+     decides on is recorded there (demo/audit_log.py);
+  5. .streamlit/secrets.toml with the app's login and database settings.
 
 Everything generated (keys, passwords, the client secret, the kubeconfig)
 stays in deploy/.secrets/ and .streamlit/secrets.toml, both git-ignored.
@@ -43,6 +47,7 @@ REALM = "k8s-agent"
 CLIENT_ID = "cluster-agent-ui"
 APP_URL = "https://localhost:8501"
 KEYCLOAK_NODE_PORT = 30443
+POSTGRES_NODE_PORT = 30432
 
 
 def run(*args: str, input_text: str | None = None, check: bool = True) -> str:
@@ -65,7 +70,8 @@ def load_or_create_values() -> dict:
     """Passwords and secrets, generated once and reused."""
     path = SECRETS_DIR / "values.json"
     values = json.loads(path.read_text()) if path.exists() else {}
-    for key in ("admin_password", "client_secret", "viewer_password", "operator_password", "cookie_secret"):
+    for key in ("admin_password", "client_secret", "viewer_password", "operator_password", "cookie_secret",
+                "postgres_password", "audit_writer_password"):
         values.setdefault(key, secrets.token_urlsafe(24))
     path.write_text(json.dumps(values, indent=2))
     path.chmod(0o600)
@@ -73,14 +79,15 @@ def load_or_create_values() -> dict:
 
 
 def make_certificates(minikube_ip: str) -> None:
-    """A local CA, then a Keycloak and an app certificate it signs. The CA is
-    what Python (and, if you import it, your browser) trusts."""
+    """A local CA, then Keycloak, PostgreSQL and app certificates it signs.
+    The CA is what Python (and, if you import it, your browser) trusts."""
     ca_key, ca_crt = SECRETS_DIR / "ca.key", SECRETS_DIR / "ca.crt"
     if not ca_crt.exists():
         run("openssl", "req", "-x509", "-newkey", "rsa:4096", "-nodes", "-days", "3650",
             "-keyout", str(ca_key), "-out", str(ca_crt), "-subj", "/CN=Cluster Agent Demo Local CA")
     for name, sans in (
         ("keycloak", f"IP:{minikube_ip},DNS:keycloak.keycloak.svc,DNS:localhost"),
+        ("postgres", f"IP:{minikube_ip},DNS:postgres.audit.svc,DNS:localhost"),
         ("app", "DNS:localhost,IP:127.0.0.1"),
     ):
         key, csr, crt = (SECRETS_DIR / f"{name}.{ext}" for ext in ("key", "csr", "crt"))
@@ -214,6 +221,86 @@ def wait_for_keycloak(keycloak_url: str, timeout: int = 300) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PostgreSQL (audit trail)
+# ---------------------------------------------------------------------------
+
+
+def database_url(values: dict, minikube_ip: str) -> str:
+    """The app's connection: the append-only role, TLS verified against the
+    local CA (verify-full: the certificate must name the minikube IP)."""
+    return (
+        f"postgresql://audit_writer:{values['audit_writer_password']}@{minikube_ip}:{POSTGRES_NODE_PORT}/audit"
+        f"?sslmode=verify-full&sslrootcert={SECRETS_DIR / 'ca.crt'}"
+    )
+
+
+def deploy_postgres(values: dict) -> None:
+    kubectl_apply(json.dumps({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "audit"}}))
+    kubectl_apply(secret_manifest("postgres-credentials", "audit", {"password": values["postgres_password"]}))
+    kubectl_apply(secret_manifest(
+        "postgres-tls", "audit",
+        {"tls.crt": (SECRETS_DIR / "postgres.crt").read_text(), "tls.key": (SECRETS_DIR / "postgres.key").read_text()},
+        "kubernetes.io/tls",
+    ))
+    kubectl_apply((REPO_ROOT / "deploy" / "postgres.yaml").read_text())
+    # The certificate may have changed (e.g. a new minikube IP): restart so
+    # PostgreSQL loads it. The data lives in the volume and survives.
+    run("kubectl", "rollout", "restart", "statefulset/postgres", "-n", "audit")
+
+
+def apply_audit_schema(values: dict, timeout: int = 300) -> None:
+    """Creates (or updates the password of) the app's role, then applies
+    deploy/audit-schema.sql as the superuser, through the pod's local socket
+    -- the SQL travels over stdin, so the password never appears in a
+    process list."""
+    run("kubectl", "rollout", "status", "statefulset/postgres", "-n", "audit", f"--timeout={timeout}s")
+    deadline = time.time() + timeout
+    while run("kubectl", "exec", "postgres-0", "-n", "audit", "--", "pg_isready", "-U", "postgres", "-d", "audit", check=False).find("accepting") < 0:
+        if time.time() > deadline:
+            raise SystemExit("PostgreSQL didn't become ready")
+        time.sleep(3)
+    password = values["audit_writer_password"].replace("'", "''")
+    role_sql = (
+        "DO $$ BEGIN\n"
+        "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'audit_writer') THEN CREATE ROLE audit_writer; END IF;\n"
+        "END $$;\n"
+        f"ALTER ROLE audit_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{password}';\n"
+    )
+    schema_sql = (REPO_ROOT / "deploy" / "audit-schema.sql").read_text()
+    run("kubectl", "exec", "-i", "postgres-0", "-n", "audit", "--",
+        "psql", "-q", "-U", "postgres", "-d", "audit", "-v", "ON_ERROR_STOP=1", "-f", "-",
+        input_text=role_sql + schema_sql)
+    print("Audit schema applied.")
+
+
+def verify_audit_database(url: str) -> None:
+    """Connects the way the app does (TLS, the app's role) and checks the
+    role can append and read but not rewrite history."""
+    import psycopg
+
+    with psycopg.connect(url, connect_timeout=10) as conn:
+        ssl_in_use = conn.execute("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()").fetchone()[0]
+        checks = [("connect over TLS", bool(ssl_in_use), True)]
+        for label, sql in (
+            ("insert a workload", "INSERT INTO workload (kind, namespace, name) VALUES ('setup-check', 'audit', 'probe')"),
+            ("delete history", "DELETE FROM manifest_change"),
+            ("update history", "UPDATE manifest_change SET status = 'applied'"),
+            ("create a table", "CREATE TABLE probe (x int)"),
+        ):
+            try:
+                with conn.transaction(force_rollback=True):
+                    conn.execute(sql)
+                allowed = True
+            except psycopg.errors.InsufficientPrivilege:
+                allowed = False
+            checks.append((label, allowed, label == "insert a workload"))
+    for label, allowed, expected in checks:
+        print(f"  app can {label}: {'yes' if allowed else 'no'}" + ("" if allowed == expected else "   <-- UNEXPECTED"))
+        if allowed != expected:
+            raise SystemExit("the audit database's permissions aren't what they should be")
+
+
+# ---------------------------------------------------------------------------
 # The agent's identity
 # ---------------------------------------------------------------------------
 
@@ -271,6 +358,8 @@ def verify_agent_permissions(kubeconfig: Path, namespaces: list[str]) -> None:
         ("patch deployments in keycloak", can("patch", "deployments", "keycloak"), False),
         ("get secrets in keycloak", can("get", "secrets", "keycloak"), False),
         ("delete deployments in demo", can("delete", "deployments", "demo"), False),
+        ("patch statefulsets in audit", can("patch", "statefulsets", "audit"), False),
+        ("get secrets in audit", can("get", "secrets", "audit"), False),
     ]
     for label, allowed, expected in checks:
         print(f"  agent can {label}: {'yes' if allowed else 'no'}" + ("" if allowed == expected else "   <-- UNEXPECTED"))
@@ -281,7 +370,7 @@ def verify_agent_permissions(kubeconfig: Path, namespaces: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def write_streamlit_secrets(values: dict, keycloak_url: str) -> None:
+def write_streamlit_secrets(values: dict, keycloak_url: str, audit_url: str) -> None:
     STREAMLIT_SECRETS.write_text(
         "# Generated by deploy/setup_secure_demo.py -- git-ignored, do not commit.\n"
         "[auth]\n"
@@ -290,6 +379,9 @@ def write_streamlit_secrets(values: dict, keycloak_url: str) -> None:
         f'client_id = "{CLIENT_ID}"\n'
         f'client_secret = "{values["client_secret"]}"\n'
         f'server_metadata_url = "{keycloak_url}/realms/{REALM}/.well-known/openid-configuration"\n'
+        "\n"
+        "[audit]\n"
+        f'database_url = "{audit_url}"\n'
     )
     STREAMLIT_SECRETS.chmod(0o600)
 
@@ -310,17 +402,23 @@ def main(argv=None) -> None:
     print(">>> Keycloak")
     deploy_keycloak(values, keycloak_url)
     wait_for_keycloak(keycloak_url)
+    print(">>> PostgreSQL (audit trail)")
+    deploy_postgres(values)
+    apply_audit_schema(values)
+    audit_url = database_url(values, minikube_ip)
+    verify_audit_database(audit_url)
     print(">>> the agent's service account and RBAC")
     deploy_agent_rbac(MANAGED_NAMESPACES)
     kubeconfig = write_agent_kubeconfig()
     verify_agent_permissions(kubeconfig, MANAGED_NAMESPACES)
     print(">>> app login settings")
-    write_streamlit_secrets(values, keycloak_url)
+    write_streamlit_secrets(values, keycloak_url, audit_url)
 
     print(f"""
 Done.
   App:       {APP_URL}            (start it with: demo/run_secure.sh)
   Keycloak:  {keycloak_url}/admin   admin / {values['admin_password']}
+  Audit DB:  postgresql://{minikube_ip}:{POSTGRES_NODE_PORT}/audit (TLS)   postgres / {values['postgres_password']}
   Users:     viewer   / {values['viewer_password']}
              operator / {values['operator_password']}
 Your browser will warn about the certificate once; to avoid it, import
