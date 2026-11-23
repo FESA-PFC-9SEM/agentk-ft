@@ -111,24 +111,106 @@ copying a new run into `runs/` never silently changes the demo's model.
   Chat), using its native tool calling; the *auditor* is the same model with
   the adapter on, exposed as the `audit_manifest` tool. One model in GPU
   memory, switching is instant.
-- **Tools:** `list_resources`, `get_manifest`, `audit_manifest`,
-  `run_kubectl` (read-only verbs only; Secret contents never printed), and
-  `apply_fix` — the only way to change the cluster: dry-run first, then it
-  pauses until you confirm. New resources (e.g. the Secret a credential fix
-  needs) are created first, and Confirm stays disabled while they still
-  contain a placeholder value.
+- **Tools:**
+
+  | Tool | What it does | Changes the cluster? |
+  |---|---|---|
+  | `list_k8s_resource_names` | names of one resource type (`workloads`, the default, lists every workload) | no |
+  | `extract_k8s_resource_yamls` | YAML of every object of a type in a namespace (at most 10; optional label selector) | no |
+  | `get_specific_object_yaml` | YAML of one object | no |
+  | `get_pod_logs` | latest log lines (`tail_lines` ≤ 200, `previous` for the run before a crash, every container by default); credential-looking values are masked | no |
+  | `get_pod_diagnostics` | phase, container states, restarts, last termination reasons, recent events, and hints (crash loop → previous logs, OOMKilled → memory limit, image pull, scheduling, probes, missing config) | no |
+  | `validate_k8s_yaml_dry_run` | server-side dry run of YAML | no |
+  | `audit_manifest` | the fine-tuned auditor on one object | no |
+  | `apply_fix` | the latest audit's fix | yes, after you confirm |
+  | `scale_resource` | replicas of a Deployment/StatefulSet/ReplicaSet/ReplicationController (0–10 in the demo) | yes, after you confirm |
+  | `apply_yaml_to_cluster` | creates or updates one object from YAML; new objects get the agent's label, so a reset removes them | yes, after you confirm |
+  | `run_kubectl` | any other read-only command | no |
+
+  `get_pod_logs` and `get_pod_diagnostics` accept a workload name too and
+  use its pods. A change tool always runs a server-side dry run first, then
+  pauses until you confirm. Only one change waits at a time, and each one is
+  recorded in the audit log with its action (`fix`, `scale` or `apply`).
+  For a fix, new resources (e.g. the Secret a credential fix needs) are
+  created first, and Confirm stays disabled while they still contain a
+  placeholder value. Every name, namespace and type the model passes is
+  validated before it becomes a kubectl argument. Secret contents are never
+  read or written by any tool, and the protected namespaces are refused.
 - **Guardrails for a 7B planner** (each added after an end-to-end run showed
   the failure): tool calls written as a ```json block are accepted; an
   answer that announces an action ("Let me check…") or tells you to run a
   `kubectl` command is retried with the reply pre-filled with `<tool_call>`;
   a fix you asked for is called by the loop itself once an audit has one
-  ready; a declined fix is never re-proposed in the same turn; a new message
-  while a change is waiting declines it and moves on; at most 8 steps.
+  ready; a "check/fix X" request answered by reading the YAML is sent to
+  `audit_manifest` (the planner must not review manifests itself); YAML in
+  your message that you asked to create/apply is proposed through
+  `apply_yaml_to_cluster` when the planner only answers in text; change
+  tools are refused unless your message asks for a change (the planner
+  otherwise tried unasked scales and fixes while diagnosing); a declined
+  change is never re-proposed in the same turn; at most 8 steps.
+- **Read tools mask leaked credentials.** `get_specific_object_yaml` and
+  `extract_k8s_resource_yamls` show plaintext credentials as `abcd***` (the
+  auditor still gets the real manifest), and `apply_yaml_to_cluster`
+  refuses YAML with masked values, so a copied manifest can't overwrite a
+  real value.
 - **Latency** on an RTX 4060 Ti: ~2–6 s per planning step, ~9–10 s per
   audit; "check X and fix it" reaches the confirmation in ~15 s.
 
-The loop is tested without a GPU or cluster (scripted planner, fake kubectl)
-in `test_agent.py`.
+The loop and the tools are tested without a GPU or cluster (scripted
+planner, fake kubectl) in `test_agent.py` and `test_agent_tools.py`.
+
+## Two tool layers: function calling or an MCP server
+
+```bash
+demo/run_secure.sh                  # --tools function (default): the tools run inside the app
+demo/run_secure.sh --tools mcp      # the tools run in demo/mcp_server.py, reached over MCP
+```
+
+The sidebar shows which layer is active. The planner, the tools' behaviour,
+the guardrails, the Confirm/Decline panel and the audit log are the same in
+both; what differs is where the tools run and how the agent reaches them.
+
+| | `function` (default) | `mcp` |
+|---|---|---|
+| Where the tools run | `Toolbox` methods, in the Streamlit process | `demo/mcp_server.py`, a separate process per chat session |
+| How the agent calls them | direct Python call | MCP `tools/call` (JSON-RPC over stdio), official MCP Python SDK |
+| Tool definitions the planner sees | `TOOLS` in `agent.py` | discovered from the server (`tools/list`); identical |
+| `audit_manifest` (the fine-tuned model) | in-process | in the host (the app), where the model is loaded |
+| Pending change, kubectl, audit log | in the app | in the server |
+
+How the MCP layer is built:
+
+- **The server** (`mcp_server.py`) serves the model's tools with the same
+  names, descriptions and JSON Schemas, running the same `Toolbox` code
+  (so every guardrail is the same), and runs `kubectl` as the agent's
+  service account. It also has `host_*` tools for the app only, never shown
+  to the model: the session's identity and role, the audit hand-off, and
+  the pending change's preview/confirm/decline.
+- **The host** (`mcp_client.py`, `McpToolbox`) has the same interface as
+  `Toolbox`, so the agent loop and the UI don't change. The MCP SDK is
+  asyncio-based and the loop is synchronous, so the client session runs on
+  its own event loop in a background thread.
+- **The model stays in the host.** `audit_manifest` fetches the manifest
+  from the server, runs the fine-tuned model in the app, and hands the
+  result back so the server's `apply_fix` can use it. MCP's *sampling*
+  (a server asking the client's model to generate) would have kept the
+  whole tool on the server, but it's deprecated in the current spec
+  (SEP-2577), and the GPU can't hold a second 7B copy in the server anyway.
+- **Changes still need your Confirm.** A model tool only *proposes* a change
+  on the server; only `host_confirm_change`, sent when you click Confirm,
+  applies it (and records it). A confirm for a change that's no longer
+  pending is refused.
+- **Trust.** Over stdio the server's only client is the app that launched
+  it, which asserts the user's identity and role from the Keycloak login.
+  Until it does, the server treats the session as a viewer (no changes). A
+  network transport would need MCP's OAuth instead.
+- **Lifecycle.** One server process per chat session, started with the
+  agent and stopped on 🗑️ Clear chat or a model reload; if the app exits,
+  the server sees its stdin close and exits too.
+
+The server also runs on its own (`finetune/.venv/bin/python -m
+demo.mcp_server`), e.g. for an MCP client such as an IDE. Such a client sees
+the `host_*` tools too, starts as a viewer, and has no `audit_manifest`.
 
 ## How it works (`core.py`)
 
@@ -243,11 +325,15 @@ The Streamlit UI has no CLI flags: the adapter is picked in the sidebar
 | `seed_minikube.sh` | applies `scenarios/*.yaml` into a `demo` namespace so there's real, flawed content to fetch |
 | `requirements.txt` | the dependencies (`flask`, `streamlit`, `Authlib`, `psycopg`) not already in `finetune/requirements.txt` |
 | `audit_log.py` | PostgreSQL audit trail: records every decided change (redacted), reads history; also a CLI |
+| `mcp_server.py` | the MCP server of the `mcp` tool layer: the agent's tools over MCP (stdio) |
+| `mcp_client.py` | the host side of the `mcp` tool layer: `McpToolbox`, the `Toolbox` interface over an MCP client session |
+| `test_mcp.py` | the `mcp` layer: host ↔ server with JSON-serialized calls, plus the real server launched over stdio |
 | `test_core.py` | unit tests for `core.py`'s pure patch-matching/application logic — run from either venv (`pytest demo/`) |
 | `run_secure.sh` | starts the secured demo: reset, then HTTPS + Keycloak login, kubectl as the agent's service account |
 | `reset_cluster.py` | restores the managed namespaces to `demo/baseline/` (`--snapshot` saves a new one) |
 | `baseline/` | the saved default state of the demo workloads |
 | `test_agent.py` | unit tests for the agent loop, tool parsing and guardrails, with a scripted planner and a fake cluster |
+| `test_agent_tools.py` | unit tests for the cluster tools (list, extract, get, validate, apply YAML, logs, diagnostics, scale) against a fake kubectl |
 | `test_audit_log.py` | redaction, what's recorded for each outcome, fail-closed behaviour; plus an opt-in test against a real PostgreSQL (`AUDIT_TEST_DATABASE_URL`) |
 
 ## Two bugs found by testing, not by writing

@@ -54,12 +54,19 @@ st.set_page_config(page_title="Kubernetes Cluster Agent", page_icon="🛡️", l
 SEVERITY_ICON = {"critical": "🟥", "high": "🟧", "medium": "🟨", "low": "🟦"}
 GREETING = "Hi! I'm your Kubernetes cluster agent."
 TOOL_LABELS = {
-    "list_resources": "Listing workloads",
-    "get_manifest": "Fetching manifest",
+    "list_k8s_resource_names": "Listing resources",
+    "extract_k8s_resource_yamls": "Extracting YAMLs",
+    "get_specific_object_yaml": "Fetching manifest",
     "audit_manifest": "Auditing with the fine-tuned model",
     "apply_fix": "Preparing the fix (server-side dry run)",
+    "validate_k8s_yaml_dry_run": "Validating YAML (server-side dry run)",
+    "apply_yaml_to_cluster": "Preparing to apply YAML (server-side dry run)",
+    "get_pod_logs": "Reading pod logs",
+    "get_pod_diagnostics": "Diagnosing pod",
+    "scale_resource": "Preparing to scale (server-side dry run)",
     "run_kubectl": "Running kubectl",
 }
+ACTION_LABEL = {"fix": "fix", "apply": "YAML apply", "scale": "scale"}
 
 
 @st.cache_resource(show_spinner=False)
@@ -124,22 +131,43 @@ def current_actor() -> audit_mod.Actor:
     )
 
 
+# The tool layer, chosen at start (demo/run_secure.sh --tools function|mcp):
+# "function" runs the tools in this process; "mcp" runs them in
+# demo/mcp_server.py, one server process per session, over MCP (stdio).
+TOOL_LAYER = os.environ.get("DEMO_TOOL_LAYER", "function")
+if TOOL_LAYER not in agent_mod.TOOL_LAYERS:
+    st.error(f"DEMO_TOOL_LAYER must be one of {', '.join(agent_mod.TOOL_LAYERS)}, not {TOOL_LAYER!r}.")
+    st.stop()
+
+
+def drop_agent() -> None:
+    """Forgets the session's agent, stopping its MCP server if it has one."""
+    agent = st.session_state.pop("agent", None)
+    if agent is not None and hasattr(agent.toolbox, "close"):
+        agent.toolbox.close()
+
+
 def get_agent(model, tokenizer, adapter_key: str, max_seq_length: int):
     """One agent per session (its conversation and pending change live in
     it), rebuilt when the loaded model changes."""
     if st.session_state.get("agent_key") != adapter_key or "agent" not in st.session_state:
-        st.session_state.agent = agent_mod.build_agent(model, tokenizer, max_seq_length)
+        drop_agent()
+        st.session_state.agent = agent_mod.build_agent(model, tokenizer, max_seq_length, tool_layer=TOOL_LAYER)
         st.session_state.agent_key = adapter_key
     # Checked again on every request: the role and identity come from the
     # login, not from anything the chat can change.
-    toolbox = st.session_state.agent.toolbox
-    toolbox.can_apply = is_operator
-    toolbox.audit_log, toolbox.actor, toolbox.adapter = current_audit_log(), current_actor(), adapter_key
+    st.session_state.agent.toolbox.set_session(is_operator, current_actor(), adapter_key, current_audit_log())
     return st.session_state.agent
 
 
 def _describe_call(name: str, arguments: dict) -> str:
-    target = "/".join(str(arguments[k]) for k in ("namespace", "kind", "name") if arguments.get(k))
+    target = "/".join(str(arguments[k]) for k in ("namespace", "kind", "resource_type", "name", "pod_name") if arguments.get(k))
+    if arguments.get("label_selector"):
+        target += f" -l {arguments['label_selector']}"
+    if arguments.get("replicas") is not None:
+        target += f" → {arguments['replicas']} replica(s)"
+    if arguments.get("manifest"):  # the YAML itself is shown in the step's result, not in its title
+        target = target or "YAML"
     detail = arguments.get("command") or target
     return f"{TOOL_LABELS.get(name, name)}" + (f" — `{detail}`" if detail else "")
 
@@ -214,6 +242,15 @@ with st.sidebar:
         st.warning("No adapter selected.")
 
     st.divider()
+    st.header("🔌 Tool layer")
+    if TOOL_LAYER == "mcp":
+        st.markdown("**MCP server** (`demo/mcp_server.py`, stdio)")
+        st.caption("The tools run in a separate process and are discovered over the Model Context Protocol.")
+    else:
+        st.markdown("**Function calling** (in-process)")
+        st.caption("The tools run inside this app. Start with `--tools mcp` to use the MCP server instead.")
+
+    st.divider()
     st.header("☸️ Cluster")
     ctx = core.kubectl_context()
     reachable = core.cluster_reachable() if ctx else False
@@ -236,7 +273,7 @@ with st.sidebar:
         st.divider()
         if st.button("🗑️ Clear chat", use_container_width=True):
             st.session_state.messages = [{"role": "assistant", "kind": "greeting", "content": GREETING}]
-            st.session_state.pop("agent", None)
+            drop_agent()
             st.rerun()
 
 # --------------------------------------------------------------------- title --
@@ -255,14 +292,15 @@ def render_history(audit_log) -> None:
             return
         st.dataframe(
             [{"#": r["id"], "when": r["decided_at"].strftime("%Y-%m-%d %H:%M:%S"), "status": f"{STATUS_ICON.get(r['status'], '')} {r['status']}",
-              "user": r["username"], "resource": f"{r['kind']} {r['namespace']}/{r['name']}", "findings": r["findings"],
+              "action": ACTION_LABEL.get(r["action"], r["action"]), "user": r["username"], "resource": f"{r['kind']} {r['namespace']}/{r['name']}", "findings": r["findings"],
               "operations": r["operations"]} for r in rows],
             hide_index=True, width="stretch",
         )
         change_id = st.selectbox("Details of change", [r["id"] for r in rows], format_func=lambda i: f"#{i}")
         c = audit_log.change(change_id)
         st.markdown(
-            f"**#{c['id']} {STATUS_ICON.get(c['status'], '')} {c['status']}** — `{c['kind']} {c['namespace']}/{c['name']}`, "
+            f"**#{c['id']} {STATUS_ICON.get(c['status'], '')} {c['status']}** ({ACTION_LABEL.get(c['action'], c['action'])}) — "
+            f"`{c['kind']} {c['namespace']}/{c['name']}`, "
             f"by **{c['username']}** ({', '.join(c['user_roles'])}) at {c['decided_at']:%Y-%m-%d %H:%M:%S}  \n"
             f"Model: `{c['model_adapter'] or '?'}`  \nRequest: {c['user_request'] or '—'}  \nResult: {c['result_message']}"
         )
@@ -353,10 +391,10 @@ def render_pending_change() -> None:
     agent = st.session_state.get("agent")
     change = agent.toolbox.pending if agent is not None else None
     if change is not None:
-        st.warning(
-            f"Proposed change to `{change.namespace}/{change.kind}/{change.name}` — passed the server-side dry run. "
-            "Nothing has been changed yet."
-        )
+        what = f"Proposed {ACTION_LABEL[change.action]} of `{change.namespace}/{change.kind}/{change.name}`"
+        st.warning(f"{what} — passed the server-side dry run. Nothing has been changed yet.")
+        if change.summary:
+            st.caption(change.summary[:1].upper() + change.summary[1:] + ".")
         for f in change.findings:
             st.caption(f"{SEVERITY_ICON.get(f['severity'], '⬜')} **{f['rule_id']}** — {f['message']}")
 

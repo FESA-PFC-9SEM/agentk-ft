@@ -11,3 +11,5 @@ streamlit>=1.42
 Authlib>=1.3.2
 # Audit trail of the agent's changes (demo/audit_log.py), in PostgreSQL.
 psycopg[binary]>=3.2
+# The "mcp" tool layer (demo/mcp_server.py, demo/mcp_client.py): the official MCP Python SDK.
+mcp>=2.3

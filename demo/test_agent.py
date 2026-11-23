@@ -64,7 +64,7 @@ def scripted(*answers):
     def planner(messages, tools, prefill=""):
         seen.append([dict(m) for m in messages])
         planner.prefills.append(prefill)
-        assert tools is TOOLS
+        assert tools == TOOLS  # equal, not identical: the MCP layer rebuilds them from tools/list
         return answers[min(len(seen), len(answers)) - 1]  # repeats the last answer when exhausted
 
     planner.seen = seen
@@ -73,8 +73,8 @@ def scripted(*answers):
 
 
 def test_parse_tool_calls_native_qwen_format():
-    calls, text, errors = parse_tool_calls("Let me check.\n" + call("list_resources", namespace="demo"))
-    assert calls == [{"name": "list_resources", "arguments": {"namespace": "demo"}}]
+    calls, text, errors = parse_tool_calls("Let me check.\n" + call("list_k8s_resource_names", namespace="demo"))
+    assert calls == [{"name": "list_k8s_resource_names", "arguments": {"namespace": "demo"}}]
     assert text == "Let me check." and errors == []
     calls, _, _ = parse_tool_calls('<tool_call>{"name": "get_manifest", "arguments": "{\\"kind\\": \\"Pod\\", \\"name\\": \\"x\\"}"}</tool_call>')
     assert calls[0]["arguments"] == {"kind": "Pod", "name": "x"}
@@ -138,7 +138,7 @@ def test_declined_change_is_not_applied():
     list(agent.ask("fix web"))
     events = list(agent.resume(approved=False))
     assert events[0].text.startswith("The user declined")
-    assert "Do not propose this fix again" in events[0].text
+    assert "Do not propose this change again" in events[0].text
     assert cluster.applied() == [] and not agent.waiting
 
 
@@ -187,7 +187,7 @@ def test_refused_command_and_unknown_tool_are_reported_to_the_planner():
 
 
 def test_step_limit_stops_a_looping_planner():
-    looping = scripted(*[call("list_resources")] * 10)
+    looping = scripted(*[call("list_k8s_resource_names")] * 10)
     events = list(Agent(looping, make_toolbox(FakeCluster()), max_steps=3).ask("loop"))
     assert events[-1].type == "final" and "stopped after 3 steps" in events[-1].text
 
@@ -220,8 +220,8 @@ def test_parse_tool_calls_accepts_a_json_block_naming_a_known_tool():
     calls, remaining, errors = parse_tool_calls(text)
     assert calls == [{"name": "audit_manifest", "arguments": {"kind": "Deployment", "name": "web"}}]
     assert remaining == "Sure, let me check." and errors == []
-    bare = '{"name": "list_resources", "arguments": {}}'
-    assert parse_tool_calls(bare)[0] == [{"name": "list_resources", "arguments": {}}]
+    bare = '{"name": "list_k8s_resource_names", "arguments": {}}'
+    assert parse_tool_calls(bare)[0] == [{"name": "list_k8s_resource_names", "arguments": {}}]
     # A JSON example that isn't a call to one of our tools stays plain text.
     example = 'Example:\n```json\n{"name": "nginx", "replicas": 2}\n```'
     assert parse_tool_calls(example)[0] == []
@@ -289,8 +289,8 @@ def test_a_second_fix_is_refused_while_one_is_pending():
 
 
 def test_unclosed_tool_call_at_the_end_is_accepted():
-    calls, _, errors = parse_tool_calls('<tool_call>\n{"name": "list_resources", "arguments": {}}')
-    assert calls == [{"name": "list_resources", "arguments": {}}] and errors == []
+    calls, _, errors = parse_tool_calls('<tool_call>\n{"name": "list_k8s_resource_names", "arguments": {}}')
+    assert calls == [{"name": "list_k8s_resource_names", "arguments": {}}] and errors == []
 
 
 def test_a_suggested_kubectl_command_is_run_instead():
@@ -366,10 +366,10 @@ def test_protected_namespaces_are_refused_and_hidden():
         [{"kind": "Deployment", "namespace": "demo", "name": "web"}, {"kind": "Deployment", "namespace": "keycloak", "name": "keycloak"}],
         None,
     )
-    assert "keycloak" not in toolbox.tool_list_resources()
-    assert toolbox.tool_list_resources(namespace="keycloak").startswith("Refused")
+    assert "keycloak" not in toolbox.tool_list_k8s_resource_names()
+    assert toolbox.tool_list_k8s_resource_names(namespace="keycloak").startswith("Refused")
     for result in (
-        toolbox.tool_get_manifest("Deployment", "keycloak", "keycloak"),
+        toolbox.tool_get_specific_object_yaml("Deployment", "keycloak", "keycloak"),
         toolbox.tool_audit_manifest("Deployment", "keycloak", "keycloak"),
         toolbox.tool_apply_fix("Deployment", "keycloak", "keycloak"),
         toolbox.tool_run_kubectl("kubectl get pods -n keycloak"),

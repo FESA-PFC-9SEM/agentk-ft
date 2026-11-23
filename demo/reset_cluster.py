@@ -10,8 +10,9 @@ top-level workloads, services and configmaps, stripped of everything the
 cluster fills in (status, uids, cluster IPs, injected token volumes...).
 Resetting deletes exactly those objects and recreates them -- deletion,
 not `apply`, because a Pod's spec can't be patched back -- and removes every
-resource the agent created (they carry core.AGENT_LABEL, e.g. the Secrets a
-credential fix adds). Secrets are never written to the baseline.
+resource the agent created (they carry core.AGENT_LABEL: the Secrets a
+credential fix adds, objects created by apply_yaml_to_cluster). Secrets are
+never written to the baseline.
 
 Only the managed namespaces (core.MANAGED_NAMESPACES) are touched: never
 keycloak, agent-system or the system namespaces. Runs with your own kubectl
@@ -126,7 +127,7 @@ def reset() -> None:
     for namespace in namespaces:
         path = str(BASELINE_DIR / f"{namespace}.yaml")
         label = f"{AGENT_LABEL[0]}={AGENT_LABEL[1]}"
-        admin_kubectl("delete", "secrets,configmaps", "-n", namespace, "-l", label, "--ignore-not-found")
+        admin_kubectl("delete", f"{KINDS},secrets", "-n", namespace, "-l", label, "--ignore-not-found", "--wait=true", "--timeout=120s")
         admin_kubectl("delete", "-f", path, "-n", namespace, "--ignore-not-found", "--wait=true", "--timeout=120s")
         admin_kubectl("apply", "-f", path, "-n", namespace)
         print(f"{namespace}: restored to the baseline")

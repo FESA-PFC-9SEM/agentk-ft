@@ -9,10 +9,14 @@ diff, the findings, every patch operation and the resources it created.
 History is append-only: the app's database role may only INSERT and SELECT,
 and triggers refuse UPDATE/DELETE on recorded changes (deploy/audit-schema.sql).
 
+Changes come from three agent tools (the `action` column): apply_fix
+("fix"), apply_yaml_to_cluster ("apply") and scale_resource ("scale").
+
 Nothing secret is stored: values at the paths a credential was found
 (KSEC-001, by the project's detectors or the model) are masked to their
-first 4 characters + "***" in both manifests and in the patch values, and a
-created Secret is stored as its key names only.
+first 4 characters + "***" in both manifests and in the patch values, a
+Secret's data values are masked, and a created Secret is stored as its key
+names only.
 
 The database runs in minikube (`audit` namespace, deploy/postgres.yaml) and
 is set up by deploy/setup_secure_demo.py, which writes its URL to
@@ -119,10 +123,17 @@ def sensitive_paths(docs: list, findings: list[dict] = ()) -> set[tuple[int, str
 def redact_manifest(yaml_text: str, findings: list[dict] = ()) -> str:
     """The manifest with every credential masked, re-serialized (always, so
     two redacted manifests diff cleanly)."""
+    from dataset.schema import mask_evidence
+
     docs = list(yaml.safe_load_all(yaml_text))
     for index, pointer in sensitive_paths(docs, findings):
         if 0 <= index < len(docs):
             _mask_at(docs[index], pointer)
+    for doc in docs:
+        if isinstance(doc, dict) and doc.get("kind") == "Secret":
+            for key in ("data", "stringData"):
+                if isinstance(doc.get(key), dict):
+                    doc[key] = {k: mask_evidence(str(v)) for k, v in doc[key].items()}
     return yaml.safe_dump_all(docs, sort_keys=False)
 
 
@@ -188,6 +199,7 @@ def build_change_record(change, status: str, result: str, chosen_images: dict | 
     return {
         "workload": {"kind": kind or change.kind, "namespace": change.namespace, "name": change.name},
         "status": status,
+        "action": change.action,
         "proposed_at": change.proposed_at,
         "user_request": change.request or None,
         "result_message": result,
@@ -260,10 +272,10 @@ class AuditLog:
                 w,
             ).fetchone()["id"]
             change_id = conn.execute(
-                "INSERT INTO manifest_change (workload_id, user_id, user_roles, status, proposed_at, model_adapter, user_request, "
+                "INSERT INTO manifest_change (workload_id, user_id, user_roles, status, action, proposed_at, model_adapter, user_request, "
                 "result_message, dry_run_output, manifest_before, manifest_after, diff) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                (workload_id, user_id, list(actor.roles), record["status"], record["proposed_at"], adapter, record["user_request"],
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (workload_id, user_id, list(actor.roles), record["status"], record["action"], record["proposed_at"], adapter, record["user_request"],
                  record["result_message"], record["dry_run_output"], record["manifest_before"], record["manifest_after"], record["diff"]),
             ).fetchone()["id"]
             with conn.cursor() as cur:
@@ -328,13 +340,13 @@ def main(argv=None) -> None:
         if not rows:
             print("No recorded changes yet.")
         for r in rows:
-            print(f"#{r['id']:<4} {r['decided_at']:%Y-%m-%d %H:%M:%S}  {r['status']:<8}  {r['username']:<10}  "
+            print(f"#{r['id']:<4} {r['decided_at']:%Y-%m-%d %H:%M:%S}  {r['status']:<8}  {r['action']:<5}  {r['username']:<10}  "
                   f"{r['kind']} {r['namespace']}/{r['name']}  ({r['findings']} finding(s), {r['operations']} operation(s))")
         return
     c = log.change(args.show)
     if c is None:
         raise SystemExit(f"no change #{args.show}")
-    print(f"Change #{c['id']}: {c['status']} -- {c['kind']} {c['namespace']}/{c['name']}")
+    print(f"Change #{c['id']}: {c['action']} {c['status']} -- {c['kind']} {c['namespace']}/{c['name']}")
     print(f"  by {c['username']} ({', '.join(c['user_roles'])}), proposed {c['proposed_at']}, decided {c['decided_at']}")
     print(f"  model: {c['model_adapter']}\n  request: {c['user_request']}\n  result: {c['result_message']}")
     for f in c["findings"]:
