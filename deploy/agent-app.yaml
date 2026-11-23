@@ -1,0 +1,232 @@
+# The cluster agent app running inside Kubernetes (instead of on the host):
+# Streamlit UI + planner + fine-tuned auditor + (with --tools mcp) the MCP
+# server as a child process, all in one pod with the GPU. Deployed by
+# deploy/deploy_app_k8s.py, which builds the image (deploy/app/Dockerfile)
+# inside minikube, creates the Secrets named below, fills in the tool layer
+# and adapter, and runs the reset Job (deploy/demo-reset-job.yaml) first.
+#
+# Namespace agent-system (protected: the agent's tools refuse it, and its own
+# service account can't change anything there). The pod runs AS that service
+# account (kube-agent, deploy/agent-rbac.yaml): kubectl inside it uses the
+# in-cluster token, so the API server's RBAC limits what the agent can do,
+# exactly as with the kubeconfig on the host.
+#
+# Secrets (created by deploy/deploy_app_k8s.py from deploy/.secrets/):
+#   agent-app-tls    -- HTTPS certificate for https://<minikube ip>:30501
+#   agent-app-ca     -- the demo's local CA (ca.crt) and a CA bundle for Python
+#   agent-app-config -- secrets.toml (Keycloak login) and the audit database URL
+#
+# Requires a node with an NVIDIA GPU exposed as nvidia.com/gpu (minikube
+# start --gpus all) -- see demo/README.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-models
+  namespace: agent-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-app
+  namespace: agent-system
+  labels:
+    app: agent-app
+    app.kubernetes.io/part-of: cluster-agent-demo
+spec:
+  replicas: 1
+  # One GPU and a ReadWriteOnce volume: the old pod must stop first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-app
+  template:
+    metadata:
+      labels:
+        app: agent-app
+    spec:
+      serviceAccountName: kube-agent
+      automountServiceAccountToken: true  # kubectl's in-cluster identity
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # The adapter's base model, downloaded once into the volume; the app
+        # then runs with HF_HUB_OFFLINE=1.
+        - name: fetch-base-model
+          image: agent-app:dev
+          imagePullPolicy: Never
+          workingDir: /app
+          command:
+            - python
+            - -c
+            - |
+              import json, os
+              from huggingface_hub import snapshot_download
+              base = json.load(open(os.path.join(os.environ["DEMO_ADAPTER"], "adapter_config.json")))["base_model_name_or_path"]
+              print("base model:", base, "->", snapshot_download(base), flush=True)
+          env:
+            - name: DEMO_ADAPTER
+              value: ADAPTER_PLACEHOLDER
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: home
+              mountPath: /home/app
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: app
+          image: agent-app:dev
+          imagePullPolicy: Never
+          workingDir: /app
+          args:
+            - streamlit
+            - run
+            - /app/demo/streamlit_app.py
+            - --server.address=0.0.0.0
+            - --server.port=8501
+            - --server.headless=true
+            - --server.sslCertFile=/etc/agent-app/tls/tls.crt
+            - --server.sslKeyFile=/etc/agent-app/tls/tls.key
+          env:
+            - name: DEMO_TOOL_LAYER
+              value: TOOLS_PLACEHOLDER  # function | mcp
+            - name: DEMO_ADAPTER
+              value: ADAPTER_PLACEHOLDER
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: SSL_CERT_FILE
+              value: /etc/agent-app/ca/ca-bundle.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/agent-app/ca/ca-bundle.pem
+            - name: AUDIT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-app-config
+                  key: database-url
+          ports:
+            - name: https
+              containerPort: 8501
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+              scheme: HTTPS
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 12Gi
+              nvidia.com/gpu: 1
+          securityContext: *container-security
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: config
+              mountPath: /app/.streamlit/secrets.toml
+              subPath: secrets.toml
+              readOnly: true
+            - name: tls
+              mountPath: /etc/agent-app/tls
+              readOnly: true
+            - name: ca
+              mountPath: /etc/agent-app/ca
+              readOnly: true
+            - name: unsloth-cache
+              mountPath: /cache
+            - name: home
+              mountPath: /home/app
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: agent-models
+        - name: config
+          secret:
+            secretName: agent-app-config
+            items:
+              - key: secrets.toml
+                path: secrets.toml
+        - name: tls
+          secret:
+            secretName: agent-app-tls
+        - name: ca
+          secret:
+            secretName: agent-app-ca
+        - name: unsloth-cache
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-app
+  namespace: agent-system
+spec:
+  type: NodePort
+  selector:
+    app: agent-app
+  ports:
+    - name: https
+      port: 8501
+      targetPort: 8501
+      nodePort: 30501
+---
+# The reset before each start (deploy/demo-reset-job.yaml) runs as its own
+# account: it may recreate the demo workloads in the managed namespaces
+# (RoleBindings added per namespace by deploy/deploy_app_k8s.py) -- never
+# keycloak, audit or agent-system -- and the agent's account can't do this.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-reset
+  namespace: agent-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: demo-reset
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, replicationcontrollers]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [secrets]  # only to remove the ones the agent created
+    verbs: [list, delete]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]

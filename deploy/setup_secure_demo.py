@@ -46,6 +46,14 @@ STREAMLIT_SECRETS = REPO_ROOT / ".streamlit" / "secrets.toml"
 REALM = "k8s-agent"
 CLIENT_ID = "cluster-agent-ui"
 APP_URL = "https://localhost:8501"
+# The app running inside the cluster (deploy/deploy_app_k8s.py): Service
+# agent-app, NodePort 30501 on the minikube IP.
+APP_NODE_PORT = 30501
+
+
+def app_urls(minikube_ip: str) -> list[str]:
+    """Where the app may run -- both are registered with Keycloak."""
+    return [APP_URL, f"https://{minikube_ip}:{APP_NODE_PORT}"]
 KEYCLOAK_NODE_PORT = 30443
 POSTGRES_NODE_PORT = 30432
 
@@ -88,6 +96,7 @@ def make_certificates(minikube_ip: str) -> None:
     for name, sans in (
         ("keycloak", f"IP:{minikube_ip},DNS:keycloak.keycloak.svc,DNS:localhost"),
         ("postgres", f"IP:{minikube_ip},DNS:postgres.audit.svc,DNS:localhost"),
+        ("app-k8s", f"IP:{minikube_ip},DNS:agent-app.agent-system.svc,DNS:localhost"),
         ("app", "DNS:localhost,IP:127.0.0.1"),
     ):
         key, csr, crt = (SECRETS_DIR / f"{name}.{ext}" for ext in ("key", "csr", "crt"))
@@ -116,7 +125,8 @@ def make_certificates(minikube_ip: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def realm_json(values: dict) -> str:
+def realm_json(values: dict, urls: list[str] | None = None) -> str:
+    urls = urls or [APP_URL]
     def user(name: str, roles: list[str]) -> dict:
         return {
             "username": name,
@@ -150,9 +160,9 @@ def realm_json(values: dict) -> str:
                 "secret": values["client_secret"],
                 "standardFlowEnabled": True,
                 "directAccessGrantsEnabled": False,
-                "redirectUris": [f"{APP_URL}/oauth2callback"],
-                "webOrigins": [APP_URL],
-                "attributes": {"post.logout.redirect.uris": f"{APP_URL}/*"},
+                "redirectUris": [f"{url}/oauth2callback" for url in urls],
+                "webOrigins": urls,
+                "attributes": {"post.logout.redirect.uris": "##".join(f"{url}/*" for url in urls)},
                 # Realm roles as a "roles" claim in the ID token, which is
                 # what Streamlit's st.user exposes.
                 "protocolMappers": [
@@ -182,7 +192,7 @@ def secret_manifest(name: str, namespace: str, data: dict, secret_type: str = "O
     return json.dumps({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": namespace}, "type": secret_type, "data": encoded})
 
 
-def deploy_keycloak(values: dict, keycloak_url: str) -> None:
+def deploy_keycloak(values: dict, keycloak_url: str, urls: list[str] | None = None) -> None:
     kubectl_apply(json.dumps({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "keycloak"}}))
     kubectl_apply(secret_manifest("keycloak-admin", "keycloak", {"username": "admin", "password": values["admin_password"]}))
     kubectl_apply(secret_manifest(
@@ -190,7 +200,7 @@ def deploy_keycloak(values: dict, keycloak_url: str) -> None:
         {"tls.crt": (SECRETS_DIR / "keycloak.crt").read_text(), "tls.key": (SECRETS_DIR / "keycloak.key").read_text()},
         "kubernetes.io/tls",
     ))
-    kubectl_apply(secret_manifest("keycloak-realm", "keycloak", {"realm.json": realm_json(values)}))
+    kubectl_apply(secret_manifest("keycloak-realm", "keycloak", {"realm.json": realm_json(values, urls)}))
     kubectl_apply(json.dumps({
         "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "keycloak-config", "namespace": "keycloak"},
         "data": {"hostname": keycloak_url},
@@ -400,7 +410,7 @@ def main(argv=None) -> None:
     values = load_or_create_values()
     make_certificates(minikube_ip)
     print(">>> Keycloak")
-    deploy_keycloak(values, keycloak_url)
+    deploy_keycloak(values, keycloak_url, app_urls(minikube_ip))
     wait_for_keycloak(keycloak_url)
     print(">>> PostgreSQL (audit trail)")
     deploy_postgres(values)
@@ -417,6 +427,7 @@ def main(argv=None) -> None:
     print(f"""
 Done.
   App:       {APP_URL}            (start it with: demo/run_secure.sh)
+             https://{minikube_ip}:{APP_NODE_PORT}  (inside Kubernetes: deploy/deploy_app_k8s.py)
   Keycloak:  {keycloak_url}/admin   admin / {values['admin_password']}
   Audit DB:  postgresql://{minikube_ip}:{POSTGRES_NODE_PORT}/audit (TLS)   postgres / {values['postgres_password']}
   Users:     viewer   / {values['viewer_password']}

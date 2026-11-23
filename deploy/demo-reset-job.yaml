@@ -1,0 +1,61 @@
+# Restores the demo workloads to their baseline before the app starts -- the
+# in-cluster equivalent of what demo/run_secure.sh does on the host
+# (demo/reset_cluster.py). Run by deploy/deploy_app_k8s.py (deleted and
+# re-created each time: a Job runs once). The baseline comes from the
+# demo-baseline ConfigMap (demo/baseline/*.yaml), so a new snapshot doesn't
+# need a new image.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-reset
+  namespace: agent-system
+  labels:
+    app.kubernetes.io/part-of: cluster-agent-demo
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: demo-reset
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reset
+          image: agent-app:dev
+          imagePullPolicy: Never
+          workingDir: /app
+          command: ["python", "demo/reset_cluster.py"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: baseline
+              mountPath: /app/demo/baseline
+              readOnly: true
+            - name: home
+              mountPath: /home/app
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: baseline
+          configMap:
+            name: demo-baseline
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

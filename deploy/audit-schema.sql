@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS manifest_change (
     user_id         bigint      NOT NULL REFERENCES app_user (id),
     user_roles      text[]      NOT NULL,       -- the user's roles at decision time
     status          text        NOT NULL CHECK (status IN ('applied', 'declined', 'rejected', 'failed')),
+    action          text        NOT NULL DEFAULT 'fix' CHECK (action IN ('fix', 'apply', 'scale')),  -- the tool that proposed it
     proposed_at     timestamptz NOT NULL,
     decided_at      timestamptz NOT NULL DEFAULT now(),
     model_adapter   text,                       -- the fine-tuned adapter that audited the manifest
@@ -45,6 +46,8 @@ CREATE TABLE IF NOT EXISTS manifest_change (
     manifest_after  text        NOT NULL,       -- redacted; what was applied (or would have been)
     diff            text        NOT NULL        -- unified diff of the two redacted manifests
 );
+-- Databases created before the action column existed.
+ALTER TABLE manifest_change ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'fix' CHECK (action IN ('fix', 'apply', 'scale'));
 CREATE INDEX IF NOT EXISTS manifest_change_workload_idx ON manifest_change (workload_id, decided_at DESC);
 CREATE INDEX IF NOT EXISTS manifest_change_decided_idx ON manifest_change (decided_at DESC);
 
@@ -94,7 +97,8 @@ SELECT c.id,
        (SELECT count(*) FROM finding f WHERE f.change_id = c.id)         AS findings,
        (SELECT count(*) FROM patch_operation p WHERE p.change_id = c.id) AS operations,
        c.model_adapter,
-       c.result_message
+       c.result_message,
+       c.action
 FROM manifest_change c
 JOIN workload w ON w.id = c.workload_id
 JOIN app_user u ON u.id = c.user_id;
