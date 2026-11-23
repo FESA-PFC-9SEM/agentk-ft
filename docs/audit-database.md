@@ -46,6 +46,7 @@ erDiagram
         bigint user_id FK
         text[] user_roles "the user's roles at decision time"
         text status
+        text action "the tool that proposed it"
         timestamptz proposed_at
         timestamptz decided_at
         text model_adapter "the fine-tuned adapter that audited the manifest"
@@ -98,7 +99,7 @@ Regenerate the diagram after changing the schema with
 |---|---|---|
 | `app_user` | Keycloak user who decided on a change | `subject` is the OIDC `sub` claim (stable across renames); username/e-mail are refreshed on each record |
 | `workload` | resource the agent changed (kind, namespace, name) | unique per (kind, namespace, name): a resource's whole history hangs off one row |
-| `manifest_change` | decided change | `status`: `applied`, `declined`, `rejected` (refused before touching the cluster: unpinned image, failed dry run, not an operator) or `failed` (an apply against the cluster failed); `user_roles` are the roles at decision time |
+| `manifest_change` | decided change | `action`: the tool that proposed it (`fix` = apply_fix, `apply` = apply_yaml_to_cluster, `scale` = scale_resource); `status`: `applied`, `declined`, `rejected` (refused before touching the cluster: unpinned image, failed dry run, not an operator) or `failed` (an apply against the cluster failed); `user_roles` are the roles at decision time |
 | `finding` | problem the fine-tuned model reported for that change | rule, severity, JSON Pointer, masked evidence |
 | `patch_operation` | RFC 6902 operation of the fix | `value` is what was applied; `suggested_value` is the model's value when the user chose another one (image tags) |
 | `created_resource` | resource the fix created (e.g. the Secret a credential moves into) | key names only, never values |
@@ -117,7 +118,8 @@ Regenerate the diagram after changing the schema with
 - **No secrets stored.** Values at the paths of a plaintext credential
   (KSEC-001, found by the project's detectors or reported by the model) are
   masked to their first 4 characters + `***` in both manifests, in the diff
-  and in patch values. Created Secrets are stored as their key names only.
+  and in patch values, and so is every value of a Secret's data. Created
+  Secrets are stored as their key names only.
 - **Nothing is applied unless it can be recorded.** While the database is
   unreachable, Confirm is disabled. The agent refuses to apply and keeps the
   change pending, so it can be confirmed once the database is back. If a
